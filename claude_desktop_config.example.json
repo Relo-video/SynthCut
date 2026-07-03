@@ -1,0 +1,11 @@
+{
+  "//": "Example MCP config for Claude Desktop. Copy the 'ai-video-editor' entry into your real claude_desktop_config.json, then fully restart Claude Desktop. Replace the path below with the absolute path to this repo on your machine.",
+  "//windows": "%APPDATA%\\Claude\\claude_desktop_config.json",
+  "//macos": "~/Library/Application Support/Claude/claude_desktop_config.json",
+  "mcpServers": {
+    "ai-video-editor": {
+      "command": "node",
+      "args": ["C:\\Users\\Dhruv\\Desktop\\AI_native_editor\\packages\\mcp\\dist\\index.js"]
+    }
+  }
+}

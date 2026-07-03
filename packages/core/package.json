@@ -1,0 +1,46 @@
+{
+  "name": "@aive/core",
+  "version": "0.1.1",
+  "description": "Headless editing engine for the AI-Native Video Editor: non-destructive timeline, FFmpeg pipeline, HTTP/WebSocket server.",
+  "license": "GPL-3.0-or-later",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js",
+    "./rpc": "./dist/rpc.js",
+    "./types": "./dist/types.js",
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "aive-core": "./dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "dev": "tsx watch src/cli.ts",
+    "start": "tsx src/cli.ts"
+  },
+  "dependencies": {
+    "@remotion/bundler": "^4.0.481",
+    "@remotion/renderer": "^4.0.481",
+    "execa": "^9.5.2",
+    "nanoid": "^5.0.9",
+    "onnxruntime-node": "^1.26.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "remotion": "^4.0.481",
+    "ws": "^8.18.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "@types/react": "^18.3.31",
+    "@types/react-dom": "^18.3.7",
+    "@types/ws": "^8.5.13",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  }
+}

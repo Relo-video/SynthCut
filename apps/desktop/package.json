@@ -1,0 +1,90 @@
+{
+  "name": "@aive/desktop",
+  "version": "0.1.1",
+  "description": "Electron + React desktop UI for the AI-Native Video Editor. Shows the timeline, clip library and preview; reflects AI edits live.",
+  "license": "GPL-3.0-or-later",
+  "private": true,
+  "author": "AI-Native Video Editor contributors",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "build:renderer": "vite build",
+    "typecheck": "tsc --noEmit",
+    "start": "npm run build:renderer && electron .",
+    "dev:renderer": "vite",
+    "electron": "electron .",
+    "prepare:bundle": "node scripts/prepare-bundle.ts",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder --win"
+  },
+  "dependencies": {
+    "@aive/core": "*",
+    "@aive/mcp": "*",
+    "electron-updater": "^6.3.9",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "@vitejs/plugin-react": "^4.3.4",
+    "electron": "^42.4.1",
+    "electron-builder": "^25.1.8",
+    "typescript": "^5.7.3",
+    "vite": "^6.0.7"
+  },
+  "build": {
+    "appId": "com.relo.synthcut",
+    "productName": "SynthCut by Relo",
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "YOUR_GITHUB_USERNAME",
+        "repo": "YOUR_REPO_NAME"
+      }
+    ],
+    "copyright": "Copyright © 2026 Relo",
+    "electronVersion": "42.4.1",
+    "npmRebuild": false,
+    "asar": false,
+    "directories": {
+      "output": "build/dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "electron/**/*",
+      "dist/renderer/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "build/resources/aive",
+        "to": "aive"
+      },
+      {
+        "from": "../../THIRD_PARTY_LICENSES.md",
+        "to": "THIRD_PARTY_LICENSES.md"
+      }
+    ],
+    "afterAllArtifactBuild": "build/afterbuild.cjs",
+    "win": {
+      "target": [
+        "nsis",
+        "zip"
+      ],
+      "artifactName": "${productName} ${version}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "SynthCut by Relo",
+      "uninstallDisplayName": "SynthCut by Relo",
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "installerHeaderIcon": "build/icon.ico",
+      "runAfterFinish": true
+    }
+  }
+}

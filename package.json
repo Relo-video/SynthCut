@@ -1,0 +1,31 @@
+{
+  "name": "ai-native-video-editor",
+  "version": "0.1.1",
+  "private": true,
+  "description": "An open-source video editor built to be operated by AI, not humans. Exposes itself as an MCP server so any MCP-compatible AI client can drive real, local FFmpeg-based edits.",
+  "license": "GPL-3.0-or-later",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace @aive/core --workspace @aive/mcp && npm run build:renderer --workspace @aive/desktop",
+    "typecheck": "tsc -b packages/core packages/mcp && npm run typecheck --workspace @aive/desktop",
+    "start": "npm run start --workspace @aive/desktop",
+    "core": "npm run start --workspace @aive/core",
+    "mcp": "npm run start --workspace @aive/mcp",
+    "clean": "node -e \"require('fs').rmSync('node_modules',{recursive:true,force:true})\""
+  },
+  "keywords": [
+    "video-editor",
+    "ffmpeg",
+    "mcp",
+    "model-context-protocol",
+    "ai",
+    "electron"
+  ]
+}

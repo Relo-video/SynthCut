@@ -1,0 +1,78 @@
+name: Release
+
+# Build the Windows installer + portable ZIP + checksums and attach them to a
+# GitHub Release. Trigger by pushing a version tag (e.g. `git tag v0.1.0 &&
+# git push --tags`) or run manually from the Actions tab.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write # needed to create/upload the GitHub Release
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build core + mcp + renderer
+        run: npm run build
+
+      - name: Package Windows installer + portable ZIP (+ SHA256SUMS)
+        # `--publish never` = build the installer AND emit the update feed
+        # (latest.yml + .blockmap) into build/dist, but let the release step below
+        # do the actual upload. Avoids electron-builder needing its own token here.
+        run: npm run dist --workspace @aive/desktop -- --publish never
+
+      # --- Free code signing for open source (optional) -----------------------
+      # Once approved by SignPath Foundation (https://signpath.org), uncomment and
+      # configure the step below to sign the installer + exe automatically. Until
+      # then the build ships unsigned (SmartScreen "More info → Run anyway").
+      #
+      # - name: Sign with SignPath (free OSS)
+      #   uses: signpath/github-action-submit-signing-request@v1
+      #   with:
+      #     api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+      #     organization-id: ${{ secrets.SIGNPATH_ORG_ID }}
+      #     project-slug: synthcut
+      #     signing-policy-slug: release-signing
+      #     artifact-configuration-slug: installer
+      #     github-artifact-id: ${{ ... }}
+      #     wait-for-completion: true
+
+      - name: Attach artifacts to the GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          # latest.yml + *.blockmap are REQUIRED for electron-updater to find and
+          # differentially download the update — never cherry-pick just the .exe.
+          files: |
+            apps/desktop/build/dist/*.exe
+            apps/desktop/build/dist/*.exe.blockmap
+            apps/desktop/build/dist/latest.yml
+            apps/desktop/build/dist/*.zip
+            apps/desktop/build/dist/SHA256SUMS.txt
+          # Must be PUBLISHED (not draft): electron-updater cannot see draft releases.
+          draft: false
+          generate_release_notes: true
+
+      # On a manual run (no tag) just keep the build outputs as CI artifacts.
+      - name: Upload build outputs (manual runs)
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: synthcut-windows
+          path: |
+            apps/desktop/build/dist/*.exe
+            apps/desktop/build/dist/*.zip
+            apps/desktop/build/dist/SHA256SUMS.txt

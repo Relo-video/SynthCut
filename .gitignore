@@ -1,0 +1,77 @@
+# ---------------------------------------------------------------------------
+# Dependencies
+# ---------------------------------------------------------------------------
+node_modules/
+.npm/
+
+# ---------------------------------------------------------------------------
+# Build output
+# ---------------------------------------------------------------------------
+dist/
+build/
+out/
+*.tsbuildinfo
+
+# Electron packaging / release artifacts
+apps/desktop/release/
+
+# Built desktop installer (large — distributed via GitHub Releases, never committed)
+/installer/
+
+# ---------------------------------------------------------------------------
+# Editor runtime data & logs
+# ---------------------------------------------------------------------------
+.aive-data/
+*.log
+*.aive            # saved project sessions (user data, not source)
+
+# ---------------------------------------------------------------------------
+# Test / scratch media & fixtures (keep the repo light; samples live outside git)
+# ---------------------------------------------------------------------------
+tmp/
+scratch/
+test_media/
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.wav
+*.mp3
+!docs/**/*.mp4
+
+# ---------------------------------------------------------------------------
+# Downloaded model / binary artifacts (fetched at runtime, never committed)
+# ---------------------------------------------------------------------------
+models/
+bin/ffmpeg*
+bin/whisper*
+*.bin
+*.cube
+*.onnx
+*.trf
+
+# ---------------------------------------------------------------------------
+# Local tooling & agent caches (not part of the project)
+# ---------------------------------------------------------------------------
+.claude/
+.impeccable/
+.mcp.local.json
+
+# ---------------------------------------------------------------------------
+# Internal planning / status docs (working notes, not shipped)
+# ---------------------------------------------------------------------------
+MODERN_EDITOR_PLAN.txt
+PARITY_POLISH_PLAN.txt
+TEST_MANUAL.md
+TEST_REPORT.md
+PRODUCT.md
+AUTO_UPDATE_SETUP.md
+docs/PROJECT_STATUS.md
+
+# ---------------------------------------------------------------------------
+# OS / editor cruft
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "ai-video-editor": {
+      "command": "node",
+      "args": ["packages/mcp/dist/index.js"]
+    }
+  }
+}
