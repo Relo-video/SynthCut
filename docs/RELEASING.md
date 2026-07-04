@@ -2,8 +2,7 @@
 
 How to ship a new version of SynthCut so that installed (Windows) users receive it
 **automatically**. This is the operator's guide to the auto-update pipeline wired
-via `electron-updater` + GitHub Releases. For the design/setup notes see
-[`../AUTO_UPDATE_SETUP.md`](../AUTO_UPDATE_SETUP.md).
+via `electron-updater` + GitHub Releases.
 
 ---
 

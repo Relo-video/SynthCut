@@ -1,12 +1,34 @@
-# AI-Native Video Editor
+<div align="center">
 
-An open-source video editor built to be operated by **AI, not humans**.
+<img src="relo-logo.png" alt="SynthCut by Relo" width="132" height="132" />
+
+<h1>SynthCut&nbsp;&nbsp;<sub><sup>by&nbsp;Relo</sup></sub></h1>
+
+<h3>An open-source video editor built to be operated by&nbsp;<em>AI,&nbsp;not&nbsp;humans</em></h3>
+
+<p>
+A full multi-track, frame-based editor that exposes itself as an <b>MCP server</b> —<br/>
+any MCP-compatible AI client drives real, local FFmpeg edits, fully offline.
+</p>
+
+<p>
+<a href="LICENSE"><img alt="License: GPL v3" src="https://img.shields.io/badge/License-GPLv3-3b82f6.svg?style=flat-square"></a>
+<img alt="Platform" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-6b7280?style=flat-square">
+<img alt="MCP server" src="https://img.shields.io/badge/MCP-server-8b5cf6?style=flat-square">
+<img alt="Electron + React" src="https://img.shields.io/badge/Electron-React-47848f?style=flat-square">
+<img alt="85 MCP tools" src="https://img.shields.io/badge/tools-85-0ea5e9?style=flat-square">
+<img alt="100% local" src="https://img.shields.io/badge/processing-100%25%20local-3ecf8e?style=flat-square">
+</p>
+
+</div>
+
+---
 
 Every video editor today — Premiere, DaVinci Resolve, CapCut — is designed for a person to click and drag. AI models can understand a user's creative intent perfectly, but they can't *operate* those tools. This project flips that: the AI is the primary operator. You describe the edit in plain language, the AI does it, you review and course-correct.
 
 The editor exposes itself as an **MCP (Model Context Protocol) server**, so any MCP-compatible client — Claude Desktop or others — connects and drives it directly. All processing is **local and offline** via FFmpeg. Your footage never leaves your machine.
 
-> **Status:** Stable. A full multi-track, frame-based editor with **85 MCP tools** — from import/cut/trim to per-clip transforms + keyframe animation, color grading, an effects stack, Whisper captions, subject-aware auto-reframe, motion graphics, media intelligence (transcript + semantic visual search), and platform export presets. Built in phases, each fully working before the next. See [Roadmap](#roadmap).
+> **Status:** Stable. A full multi-track, frame-based editor with **85 MCP tools** — from import/cut/trim to per-clip transforms + keyframe animation, color grading, an effects stack, Whisper captions, subject-aware auto-reframe, motion graphics, media intelligence (transcript + semantic visual search), and platform export presets.
 
 ## Download & install (Windows)
 
@@ -55,8 +77,8 @@ A single persistent **core** owns all editing state. The AI mutates a non-destru
 ## Tech
 
 - **FFmpeg** — all video processing, fully local. Invoked as an external process (not linked). It ships as a GPL build, which is compatible with this project's GPL-3.0 license.
-- **Whisper (whisper.cpp)** — local speech-to-text for captions. *(Phase 3)*
-- **Remotion** — AI-authored React components for motion graphics. *(Phase 4)*
+- **Whisper (whisper.cpp)** — local speech-to-text for captions.
+- **Remotion** — AI-authored React components for motion graphics.
 - **MCP server** — clean tool definitions any MCP client can call.
 - **Electron + React** — desktop UI: timeline, clip library, preview.
 
@@ -65,21 +87,23 @@ A single persistent **core** owns all editing state. The AI mutates a non-destru
 ```
 packages/core    @aive/core  — headless editing engine + WebSocket server
 packages/mcp     @aive/mcp   — MCP server exposing editor tools to AI clients
-apps/desktop                 — Electron + React desktop UI  (Phase 1)
+apps/desktop                 — Electron + React desktop UI
 ```
 
-## Roadmap
+## Features
 
-- **Phase 0** — Monorepo scaffold ✅
-- **Phase 1** — Core engine + MCP tools + Electron UI: import, cut/trim/split/concat/reorder, preview, export, undo/redo ✅
-- **Phase 2** — Reframe (9:16/1:1/16:9) + crop, color grade + LUTs, speed ramps, fades, crossfade transitions, stabilization, background music + ducking, and burned-in text overlays ✅
-- **Phase 3** — Whisper captions + subject-tracking auto-reframe + J/L audio cuts ✅
-- **Phase 4** — Remotion motion graphics (AI-authored React components → alpha overlays) ✅
-- **Phase 5** — Packaged Windows installer (offline-first, bundled FFmpeg + Whisper + YuNet + font), `THIRD_PARTY_LICENSES`, docs, contributor guide ✅ *(macOS/Linux installers configured but not yet built)*
+A full multi-track, frame-based editing workstation. Every capability is exposed as an MCP tool — and each tool is simultaneously an AI action *and* a UI action, defined exactly once in the core's RPC registry:
 
-Beyond the initial roadmap, the editor grew into a full multi-track workstation: a real-time Canvas2D compositor, per-clip transforms with keyframe animation, color grading (wheels/curves/white-balance) and a stackable effects chain, media intelligence (folders, transcript indexing + search, perceptual and CLIP semantic visual search, audio sync), a vision-based `inspect_timeline` loop for the AI, native keyframe-animated text, platform export presets, and proxy media for fast preview.
+- **Editing** — import, cut / trim / split / concat / reorder, multi-track timeline, ripple edits, undo/redo.
+- **Framing** — reframe (9:16 / 1:1 / 16:9) + crop, subject-tracking auto-reframe, stabilization.
+- **Motion** — per-clip transforms with keyframe animation, native keyframe-animated text.
+- **Color** — grading (wheels / curves / white-balance), LUTs, and a stackable effects chain.
+- **Audio** — speed ramps, fades, crossfade transitions, background music + ducking, J/L audio cuts.
+- **Captions & graphics** — Whisper speech-to-text captions and Remotion-authored motion graphics.
+- **Media intelligence** — folders, transcript indexing + search, perceptual and CLIP semantic visual search, audio sync, and a vision-based `inspect_timeline` loop for the AI.
+- **Output** — real-time Canvas2D compositor preview, proxy media for fast preview, and platform export presets.
 
-**85 MCP tools** in total — each is simultaneously an AI tool and a UI action, defined exactly once in the core's RPC registry.
+**85 MCP tools** in total, all processing local and offline via FFmpeg.
 
 ## Install (packaged app)
 

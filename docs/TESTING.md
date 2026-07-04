@@ -189,7 +189,7 @@ app reconnects to the same session when you open it.
 
 You should see the editor tools in your client's tool list (`/mcp` in Claude Code).
 
-### 5.2 A test script (covers every phase)
+### 5.2 A test script (end-to-end)
 
 Paste these to Claude one at a time and watch the timeline (or ask it to
 `render_preview` and open the returned path). Replace the import paths with your

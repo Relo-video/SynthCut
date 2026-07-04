@@ -90,7 +90,7 @@ to the running editor core over HTTP. The desktop app talks to the same core
 over WebSocket. So the AI and you operate **one shared project** — no syncing,
 no conflicts.
 
-## Available AI tools (Phase 1)
+## Available AI tools
 
 `import_video`, `append_clip`, `insert_clip`, `trim_clip`, `split_clip`,
 `cut_range`, `remove_clip`, `move_clip`, `set_project_settings`,

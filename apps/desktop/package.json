@@ -1,6 +1,6 @@
 {
   "name": "@aive/desktop",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Electron + React desktop UI for the AI-Native Video Editor. Shows the timeline, clip library and preview; reflects AI edits live.",
   "license": "GPL-3.0-or-later",
   "private": true,
@@ -38,8 +38,8 @@
     "publish": [
       {
         "provider": "github",
-        "owner": "YOUR_GITHUB_USERNAME",
-        "repo": "YOUR_REPO_NAME"
+        "owner": "Relo-video",
+        "repo": "SynthCut"
       }
     ],
     "copyright": "Copyright © 2026 Relo",
@@ -71,7 +71,7 @@
         "nsis",
         "zip"
       ],
-      "artifactName": "${productName} ${version}.${ext}"
+      "artifactName": "SynthCut-${version}.${ext}"
     },
     "nsis": {
       "oneClick": false,
