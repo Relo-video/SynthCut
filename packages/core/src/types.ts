@@ -56,6 +56,12 @@ export interface MediaAsset {
    */
   proxyPath?: string;
   /**
+   * Why the background proxy transcode failed (if it did) — recorded instead of
+   * being swallowed, so clients can explain slow scrubbing and retry via
+   * generate_proxy. Cleared when a proxy succeeds.
+   */
+  proxyError?: string;
+  /**
    * Optional BROWSER-PLAYABLE preview proxy (VP8/alpha .webm) for assets whose
    * `path` a browser can't decode — currently alpha motion-graphic ProRes .mov
    * overlays. The Canvas2D preview draws this so graphics show live; EXPORT still
@@ -64,9 +70,23 @@ export interface MediaAsset {
   previewPath?: string;
   /** Optional library folder this asset belongs to (id of a {@link MediaFolder}). */
   folderId?: string;
-  /** Cached spoken-word transcript (for search); built on demand. */
+  /**
+   * Cached spoken-word transcript (for search). NOTE: at runtime this lives in
+   * the engine's assetCaches (outside the undo history — transcripts are large
+   * and immutable per asset); it is merged back into this field only when the
+   * project is SERIALIZED (.aive save / crash-recovery snapshot) and extracted
+   * again on load. Live project state carries `transcriptIndexed` instead.
+   */
   transcript?: AssetTranscript;
-  /** Cached perceptual visual fingerprint (for visual search); built on demand. */
+  /** True when a transcript is cached for this asset (the live-state marker). */
+  transcriptIndexed?: boolean;
+  /**
+   * True when the source file could not be found on disk (offline placeholder
+   * from an OTIO/project import). Rendering clips of a missing asset fails —
+   * re-import or relink the file, or remove_asset it.
+   */
+  missing?: boolean;
+  /** Cached perceptual visual fingerprint. Same engine-cache lifecycle as `transcript`. */
   visualSig?: VisualSignature;
 }
 
@@ -85,9 +105,22 @@ export interface TranscriptSegment {
   text: string;
 }
 
+/** A single spoken WORD with per-word timing (seconds, asset-relative). */
+export interface TranscriptWord {
+  start: number;
+  end: number;
+  text: string;
+}
+
 /** A full asset transcript (spoken-word index for search), plus which model made it. */
 export interface AssetTranscript {
   segments: TranscriptSegment[];
+  /**
+   * Word-level timestamps (whisper token offsets merged into words). The basis
+   * of text-based editing: delete_transcript_ranges / tighten_talk /
+   * edit_by_transcript address these by index.
+   */
+  words?: TranscriptWord[];
   model?: string;
   language?: string;
 }
@@ -390,7 +423,15 @@ export interface ClipEffects {
  */
 export interface Clip {
   id: string;
-  assetId: string;
+  /** Source asset. ABSENT for adjustment layers (`adjustment: true`). */
+  assetId?: string;
+  /**
+   * True = ADJUSTMENT LAYER: a source-less clip whose color grade + effects
+   * apply to the composite of every video track BELOW it, only while the clip
+   * is active on the timeline. Grade/effect tools (apply_color, apply_effect,
+   * color_grade, …) work on it unchanged — they only touch `effects`.
+   */
+  adjustment?: boolean;
   /** Absolute start position on the track, in project frames. */
   startFrame: number;
   /** Start point within the source asset, in project frames (seconds × fps). */
@@ -481,8 +522,11 @@ export interface Project {
   tracks: Track[];
   /** Optional background music mixed under the whole timeline. */
   music?: MusicSettings;
-  /** Timeline-wide marker positions, in frames (ruler flags + snap targets). */
-  markers?: number[];
+  /**
+   * Timeline-wide NAMED markers (ruler flags + snap targets + the human↔AI
+   * annotation channel: leave notes for the editor/reviewer on the timeline).
+   */
+  markers?: Marker[];
   /** Bumped on every mutation; lets clients detect staleness. */
   revision: number;
   /** Schema version of this project (for .aive migration). */
@@ -491,8 +535,23 @@ export interface Project {
   updatedAt: number;
 }
 
-/** Current project schema version. v1 = single-track seconds; v2 = multi-track frames. */
-export const PROJECT_SCHEMA_VERSION = 2;
+/** A named timeline marker (frame-positioned ruler flag with optional annotation). */
+export interface Marker {
+  /** Absolute timeline frame. */
+  frame: number;
+  /** Short label shown in the ruler tooltip. */
+  name?: string;
+  /** Display color (CSS color for the UI flag). */
+  color?: string;
+  /** Longer annotation — review notes, to-dos, hand-off context. */
+  note?: string;
+}
+
+/**
+ * Current project schema version. v1 = single-track seconds; v2 = multi-track
+ * frames; v3 = named markers ({frame,name?,color?,note?} instead of number[]).
+ */
+export const PROJECT_SCHEMA_VERSION = 3;
 
 /** Timeline footprint of a clip in project frames (accounts for speed). */
 export function clipDurationFrames(clip: Clip): number {
@@ -511,7 +570,10 @@ export function clipEndFrame(clip: Clip): number {
  * the frame-based model at stage time so the graph builder stays frame-agnostic.
  */
 export interface ResolvedRenderClip {
+  /** Source file path ("" for adjustment layers — they contribute no input). */
   path: string;
+  /** True = adjustment layer: apply `effects` to the stacked composite below. */
+  adjustment?: boolean;
   /** Stacking key of the owning track (video z-order; ascending = on top). */
   trackIndex: number;
   /** Include this clip's picture in the composite (video track AND not hidden). */
@@ -590,6 +652,20 @@ export interface ExportSettings {
   audioCodec?: "aac" | "opus";
   /** Audio bitrate, e.g. "192k". */
   audioBitrate?: string;
+  /**
+   * Opt into HARDWARE video encoding (NVENC/QSV/AMF/VideoToolbox) for SPEED at
+   * some quality-per-bit cost. Export defaults to software libx264/x265 for
+   * quality; previews use hardware automatically when available (AIVE_HWENC).
+   */
+  hardware?: boolean;
+  /**
+   * Normalize the final mix to this integrated loudness (LUFS, e.g. -14 for
+   * YouTube/social, -16 for web). Applied as a single-pass `loudnorm` on the
+   * export's master audio. Omit for no normalization (master preset).
+   */
+  loudnessTarget?: number;
+  /** True-peak ceiling in dBTP for loudness normalization (default -1.5). */
+  truePeak?: number;
 }
 
 /** Output canvas geometry for a render. */

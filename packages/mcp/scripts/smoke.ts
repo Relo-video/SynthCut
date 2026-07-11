@@ -65,10 +65,12 @@ async function main() {
 
   const c1 = parse((await client.callTool({ name: "append_clip", arguments: { assetId: a.asset.id } })) as ToolText);
   await client.callTool({ name: "append_clip", arguments: { assetId: b.asset.id } });
-  await client.callTool({ name: "cut_range", arguments: { clipId: c1.clip.id, start: 1, end: 2 } });
+  // cut_range is frame-based (30fps default canvas): cut 1s–2s = frames 30–60.
+  parse((await client.callTool({ name: "cut_range", arguments: { clipId: c1.clip.id, startFrame: 30, endFrame: 60 } })) as ToolText);
 
   const summary = parse((await client.callTool({ name: "timeline_summary", arguments: {} })) as ToolText);
-  console.log(`6. timeline: ${summary.clipCount} clips, ${summary.totalDuration}s total`);
+  const clipCount = summary.tracks.reduce((n: number, t: { clips: unknown[] }) => n + t.clips.length, 0);
+  console.log(`6. timeline: ${clipCount} clips, ${summary.totalDuration}s total`);
 
   // 6. Export through MCP.
   const out = join(dataDir, "mcp-out.mp4");
@@ -76,9 +78,12 @@ async function main() {
   const info = await stat(exported.path);
   console.log(`7. exported via MCP: ${exported.path} (${info.size} bytes, ${exported.duration}s)`);
 
-  // cut_range split clip A into two remainders (0-1s, 2-5s) + clip B = 3 clips, 8s total.
-  if (summary.clipCount !== 3) throw new Error(`expected 3 clips, got ${summary.clipCount}`);
-  if (Math.abs(summary.totalDuration - 8) > 0.2) throw new Error(`expected ~8s, got ${summary.totalDuration}`);
+  // cut_range split clip A into two remainders (its duration minus the 1s cut)
+  // + clip B = 3 clips, (A - 1) + B seconds total.
+  const expected = a.asset.duration - 1 + b.asset.duration;
+  if (clipCount !== 3) throw new Error(`expected 3 clips, got ${clipCount}`);
+  if (Math.abs(summary.totalDuration - expected) > 0.2)
+    throw new Error(`expected ~${expected.toFixed(2)}s, got ${summary.totalDuration}`);
   if (info.size < 1000) throw new Error("export file is too small");
 
   await client.close();

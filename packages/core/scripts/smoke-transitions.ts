@@ -18,24 +18,26 @@ async function main() {
   const dataDir = mkdtempSync(join(tmpdir(), "aive-tr-"));
   const engine = new EditorEngine(dataDir);
 
-  const a = await engine.importVideo(clipA); // 5s
-  const b = await engine.importVideo(clipB); // 4s
+  const a = await engine.importVideo(clipA);
+  const b = await engine.importVideo(clipB);
   const fps = engine.fps;
-  engine.appendClip(a.id); // clip 1: 5s
-  const c2 = engine.appendClip(b.id); // clip 2: 4s
-  const c3 = engine.appendClip(a.id); // clip 3: 5s
-  console.log(`baseline timeline: ${engine.timelineDuration().toFixed(2)}s (expect ~14)`);
+  engine.appendClip(a.id);
+  const c2 = engine.appendClip(b.id);
+  const c3 = engine.appendClip(a.id);
+  // Expectations derive from the PROBED durations so any test media works.
+  const baseline = 2 * a.duration + b.duration;
+  console.log(`baseline timeline: ${engine.timelineDuration().toFixed(2)}s (expect ~${baseline.toFixed(1)})`);
 
   // 1s crossfade entering clip 2 -> overlaps clip1/clip2 by 1s.
   engine.setTransition(c2.id, "fade", Math.round(1 * fps));
   const afterT = engine.timelineDuration();
-  console.log(`after 1s crossfade into clip2: ${afterT.toFixed(2)}s (expect ~13)`);
-  if (Math.abs(afterT - 13) > 0.15) throw new Error(`transition duration math wrong: ${afterT}`);
+  console.log(`after 1s crossfade into clip2: ${afterT.toFixed(2)}s (expect ~${(baseline - 1).toFixed(1)})`);
+  if (Math.abs(afterT - (baseline - 1)) > 0.15) throw new Error(`transition duration math wrong: ${afterT}`);
 
   // dissolve entering clip 3 too.
   engine.setTransition(c3.id, "dissolve", Math.round(0.8 * fps));
   const total = engine.timelineDuration();
-  console.log(`after dissolve into clip3: ${total.toFixed(2)}s (expect ~12.2)`);
+  console.log(`after dissolve into clip3: ${total.toFixed(2)}s (expect ~${(baseline - 1.8).toFixed(1)})`);
 
   const out = join(dataDir, "tr.mp4");
   const result = await engine.exportVideo(out);

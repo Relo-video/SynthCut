@@ -11,6 +11,8 @@ interface FfprobeStream {
   avg_frame_rate?: string;
   r_frame_rate?: string;
   duration?: string;
+  side_data_list?: { side_data_type?: string; rotation?: number }[];
+  tags?: { rotate?: string };
 }
 
 interface FfprobeFormat {
@@ -34,6 +36,19 @@ function parseRate(rate: string | undefined): number {
   const [num, den] = rate.split("/").map(Number);
   if (!den || !Number.isFinite(num) || !Number.isFinite(den)) return Number(rate) || 0;
   return num / den;
+}
+
+/**
+ * Rotation (degrees) a player must apply to display the stream, from the
+ * Display Matrix side data (phone/WhatsApp portrait video) or the legacy
+ * `rotate` tag. FFmpeg auto-rotates on decode, so every downstream frame is
+ * already upright — the probe must report DISPLAY dimensions to match.
+ */
+function streamRotation(video: FfprobeStream): number {
+  const sd = video.side_data_list?.find((s) => typeof s.rotation === "number");
+  const raw = sd?.rotation ?? Number(video.tags?.rotate ?? 0);
+  if (!Number.isFinite(raw)) return 0;
+  return ((Math.round(raw) % 360) + 360) % 360;
 }
 
 /**
@@ -83,13 +98,20 @@ export async function probeAsset(path: string): Promise<MediaAsset> {
 
   const fps = video ? parseRate(video.avg_frame_rate) || parseRate(video.r_frame_rate) || 30 : 30;
 
+  // Portrait phone footage stores landscape pixels + a rotation side data entry.
+  // Decoders auto-rotate, so swap to display dimensions for 90°/270° streams.
+  const rotation = video ? streamRotation(video) : 0;
+  const swapDims = rotation === 90 || rotation === 270;
+  const displayWidth = swapDims ? video?.height ?? 0 : video?.width ?? 0;
+  const displayHeight = swapDims ? video?.width ?? 0 : video?.height ?? 0;
+
   return {
     id: newId("asset"),
     path,
     name: basename(path),
     duration,
-    width: video?.width ?? 0,
-    height: video?.height ?? 0,
+    width: displayWidth,
+    height: displayHeight,
     fps: isImage ? 30 : Math.round(fps * 1000) / 1000,
     hasVideo: Boolean(video),
     hasAudio: Boolean(audio),

@@ -26,6 +26,7 @@ if (process.platform === "win32") {
 let coreChild = null;
 let coreOwned = false;
 let corePort = null;
+let coreToken = null;
 
 // Project state mirrored from the renderer so the main process can guard quit.
 let mainWin = null;
@@ -114,7 +115,7 @@ function onWindowClose(e) {
   sendMenu(projectHasPath ? "save" : "save-as");
 }
 
-function createWindow(port) {
+function createWindow(port, token) {
   const win = new BrowserWindow({
     width: 1360,
     height: 880,
@@ -153,11 +154,11 @@ function createWindow(port) {
 
   const devUrl = process.env.ELECTRON_RENDERER_URL;
   if (devUrl) {
-    win.loadURL(`${devUrl}?port=${port}`);
+    win.loadURL(`${devUrl}?port=${port}&token=${encodeURIComponent(token || "")}`);
     win.webContents.openDevTools({ mode: "detach" });
   } else {
     win.loadFile(path.join(__dirname, "..", "dist", "renderer", "index.html"), {
-      query: { port: String(port) },
+      query: { port: String(port), token: String(token || "") },
     });
   }
 }
@@ -252,11 +253,12 @@ app.whenReady().then(async () => {
 
     const result = await ensureCore(process.execPath);
     corePort = result.port;
+    coreToken = result.token;
     coreOwned = result.owned;
     coreChild = result.child;
     console.error(`[aive] ${coreOwned ? "started" : "attached to existing"} core on port ${corePort}`);
     buildMenu();
-    createWindow(corePort);
+    createWindow(corePort, coreToken);
     setupAutoUpdate();
   } catch (err) {
     dialog.showErrorBox(
@@ -268,7 +270,7 @@ app.whenReady().then(async () => {
   }
 
   app.on("activate", () => {
-    if (BrowserWindow.getAllWindows().length === 0 && corePort) createWindow(corePort);
+    if (BrowserWindow.getAllWindows().length === 0 && corePort) createWindow(corePort, coreToken);
   });
 });
 

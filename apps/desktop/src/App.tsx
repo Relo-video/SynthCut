@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import type { CoreApi } from "./api";
-import type { Clip, ColorInspection, KeyframeProperty, MediaAsset, Project, ProgressInfo, TextStyle, TranscriptHit, VisualEffect, VisualHit } from "./types";
+import type { Clip, ColorInspection, KeyframeProperty, Marker, MediaAsset, Project, ProgressInfo, TextStyle, TranscriptHit, VisualEffect, VisualHit } from "./types";
 import { clipDurationFrames } from "./types";
 import {
   buildSegments, createPlaybackStore, fmtTime, usePlaybackValue,
@@ -269,7 +269,7 @@ export function App({ api }: { api: CoreApi }) {
   const setTrackProps = (trackIndex: number, patch: Record<string, unknown>) =>
     run("Track", () => api.rpc("set_track_properties", { trackIndex, ...patch }));
   const addTrack = (kind: "video" | "audio") => run("Add track", () => api.rpc("add_track", { kind }));
-  const setMarkers = (frames: number[]) => run("Markers", () => api.rpc("set_markers", { frames }));
+  const setMarkers = (markers: Marker[]) => run("Markers", () => api.rpc("set_markers", { frames: markers }));
   const removeTrack = (trackIndex: number) => run("Remove track", () => api.rpc("remove_track", { trackIndex }));
   const setAspect = (width: number, height: number) =>
     run("Setting aspect", () => api.rpc("set_project_settings", { width, height }));
@@ -746,7 +746,7 @@ export function App({ api }: { api: CoreApi }) {
                           </>
                         )}
                         <span>{fmt(a.duration)}</span>
-                        {a.transcript && <><span className="sep">·</span><span title="Transcript indexed">◎</span></>}
+                        {(a.transcriptIndexed || a.transcript) && <><span className="sep">·</span><span title="Transcript indexed">◎</span></>}
                         {a.proxyPath && <><span className="sep">·</span><span title="Preview proxy ready (export uses full res)">⚡</span></>}
                         {a.hasAudio && (
                           <>
@@ -911,8 +911,8 @@ export function App({ api }: { api: CoreApi }) {
               key={selected.id}
               clip={selected}
               index={selectedIndex}
-              asset={assetById.get(selected.assetId)}
-              thumb={thumbs[selected.assetId]}
+              asset={selected.assetId ? assetById.get(selected.assetId) : undefined}
+              thumb={selected.assetId ? thumbs[selected.assetId] : undefined}
               project={project}
               connected={connected}
               busy={!!busy}

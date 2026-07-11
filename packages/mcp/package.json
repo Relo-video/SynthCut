@@ -19,10 +19,12 @@
   "dependencies": {
     "@aive/core": "*",
     "@modelcontextprotocol/sdk": "^1.13.0",
+    "ws": "^8.21.0",
     "zod": "^3.24.1"
   },
   "devDependencies": {
     "@types/node": "^22.10.5",
+    "@types/ws": "^8.18.1",
     "tsx": "^4.19.2",
     "typescript": "^5.7.3"
   }

@@ -79,7 +79,8 @@ function startCore(dir, execPath) {
           if (msg.event === "ready" && msg.port && !settled) {
             settled = true;
             clearTimeout(timeout);
-            resolve({ child, port: msg.port });
+            // token: session auth secret; also published in <dataDir>/server.json.
+            resolve({ child, port: msg.port, token: msg.token || (readServerInfo(dir) || {}).token || "" });
           }
         } catch {
           /* non-JSON log line; ignore */
@@ -105,18 +106,20 @@ function startCore(dir, execPath) {
 }
 
 /**
- * Ensure a core is available. Returns { port, owned, child }.
+ * Ensure a core is available. Returns { port, token, owned, child }.
  *   owned=false → attached to a core someone else started (do NOT kill it).
  *   owned=true  → we spawned it (kill it on quit).
+ * `token` is the core's per-run session secret — every HTTP/WS/file request
+ * must carry it, so the launcher hands it to the renderer alongside the port.
  */
 async function ensureCore(execPath) {
   const dir = getDataDir();
   const info = readServerInfo(dir);
   if (info && info.port && (await healthCheck(info.port))) {
-    return { port: info.port, owned: false, child: null };
+    return { port: info.port, token: info.token || "", owned: false, child: null };
   }
-  const { child, port } = await startCore(dir, execPath);
-  return { port, owned: true, child };
+  const { child, port, token } = await startCore(dir, execPath);
+  return { port, token: token || "", owned: true, child };
 }
 
 module.exports = { ensureCore, startCore, getDataDir, coreCliPath, readServerInfo, healthCheck };

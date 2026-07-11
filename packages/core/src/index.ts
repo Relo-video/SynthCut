@@ -4,4 +4,7 @@ export { EditorServer } from "./server.js";
 export { dispatch, methods, RpcError } from "./rpc.js";
 export type { MethodName, RpcMethod } from "./rpc.js";
 export { checkBinaries } from "./ffmpeg/executor.js";
+export { JobManager } from "./jobs.js";
+export type { Job, JobType, JobStatus } from "./jobs.js";
+export { pruneDataDir } from "./gc.js";
 export * from "./types.js";

@@ -1,8 +1,11 @@
 import { EventEmitter } from "node:events";
-import { mkdir, writeFile, readFile, copyFile, stat, readdir } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdir, writeFile, readFile, copyFile, stat, readdir, rm, rename, utimes } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join, dirname, basename, isAbsolute } from "node:path";
+import { join, dirname, basename, isAbsolute, resolve, sep } from "node:path";
 import { newId } from "./ids.js";
+import { JobManager, type Job } from "./jobs.js";
+import { pruneDataDir } from "./gc.js";
 import { probeAsset } from "./ffmpeg/ffprobe.js";
 import {
   detectSilence,
@@ -12,8 +15,12 @@ import {
   type SceneCut,
   type ColorInspection,
 } from "./ffmpeg/analysis.js";
-import { runFfmpeg } from "./ffmpeg/executor.js";
-import { transcribe, type TranscriptCue } from "./whisper/transcribe.js";
+import { runFfmpeg, pickHwEncoder } from "./ffmpeg/executor.js";
+import { planSegments, segmentKey, collectMtimes, type PlannedSegment } from "./ffmpeg/segments.js";
+import { transcribe, transcribeFull, type TranscriptCue } from "./whisper/transcribe.js";
+import { parseSrt, parseVtt, formatSrt, formatVtt } from "./captions/srt.js";
+import { wrapText, maxCharsPerLine } from "./text/wrap.js";
+import { projectToOtio, otioToProject } from "./interop/otio.js";
 import { DEFAULT_MODEL, type WhisperModel } from "./whisper/setup.js";
 import { buildSignature, buildReferenceSample, signatureSimilarity } from "./media/signature.js";
 import { findAudioOffset, type AudioSyncResult } from "./media/audiosync.js";
@@ -46,11 +53,13 @@ import {
   type CaptionCue,
   type CaptionStyle,
   type AssetTranscript,
+  type TranscriptWord,
   type Clip,
   type ClipEffects,
   type ColorGrade,
   type ExportSettings,
   type GraphicOverlay,
+  type Marker,
   type MediaFolder,
   type VisualSignature,
   type MediaAsset,
@@ -205,6 +214,8 @@ export interface RenderResult {
 export interface EngineEvents {
   change: (project: Project) => void;
   progress: (info: { job: "preview" | "export"; fraction: number }) => void;
+  /** Emitted on every job state/progress change (start, progress, done/error/canceled). */
+  job: (job: Job) => void;
 }
 
 function defaultProject(): Project {
@@ -246,12 +257,100 @@ export class EditorEngine extends EventEmitter {
   /** `project.revision` as of the last save/load. The project has unsaved changes
    *  whenever the live revision has moved past this. A fresh project starts clean. */
   private lastSavedRevision = 0;
-  private previewAbort: AbortController | null = null;
-  private previewCache: { revision: number; path: string } | null = null;
+  /** Last full preview render. Keyed by project id AND revision — revision is a
+   *  per-project counter, so without the id a new/loaded project whose revision
+   *  happens to match would wrongly serve the previous project's preview. */
+  private previewCache: { projectId: string; revision: number; path: string } | null = null;
+  /** Job id of the in-flight preview render, so a new preview cancels the old. */
+  private previewJobId: string | null = null;
+  /** Long-running work: observable, cancelable, progress-reporting (see jobs.ts). */
+  readonly jobs = new JobManager();
+  /** Debounced crash-recovery autosave timer (see scheduleRecoverySave). */
+  private recoveryTimer: NodeJS.Timeout | null = null;
+  /** Path of a crash-recovery file found at startup (cleared on explicit save). */
+  private recoveryPath: string | null = null;
+  /**
+   * Heavy, immutable-per-asset derived data (transcripts, visual fingerprints)
+   * kept OUTSIDE the project so `mutate()`'s undo snapshots stay small — a long
+   * transcript cloned into 100 history entries was real memory pressure. Merged
+   * back into the asset objects when the project is serialized (save/recovery)
+   * and extracted again on load. Live assets carry a `transcriptIndexed` marker.
+   */
+  private assetCaches = new Map<string, { transcript?: AssetTranscript; visualSig?: VisualSignature }>();
 
   /** Directory where previews, thumbnails and other render artifacts are written. */
   constructor(readonly dataDir: string) {
     super();
+    this.jobs.on("job", (job) => this.emit("job", job));
+    // Crash recovery: 30s after the first unsaved change, snapshot the project
+    // to <dataDir>/autosave/current.aive.recovery (cheap — it's JSON). An
+    // explicit save clears it. If a previous session left one behind, surface
+    // it so the UI/AI can offer recovery (load_project on it).
+    const recovery = join(this.dataDir, "autosave", "current.aive.recovery");
+    if (existsSync(recovery)) this.recoveryPath = recovery;
+    this.on("change", () => this.scheduleRecoverySave());
+  }
+
+  // ---- crash recovery --------------------------------------------------------
+  /**
+   * Recovery snapshot info for the state envelope / get_state: whether a
+   * crash-recovery file exists and where. Load it with load_project to recover.
+   */
+  recoveryInfo(): { available: boolean; path?: string } {
+    return this.recoveryPath ? { available: true, path: this.recoveryPath } : { available: false };
+  }
+
+  private scheduleRecoverySave(): void {
+    if (this.recoveryTimer) return; // already pending — throttle, don't re-arm
+    this.recoveryTimer = setTimeout(() => {
+      this.recoveryTimer = null;
+      void this.writeRecoverySnapshot().catch(() => {});
+    }, 30_000);
+    // Never keep the process alive just for an autosave.
+    this.recoveryTimer.unref?.();
+  }
+
+  /**
+   * The project as persisted to disk: the live project plus the engine-side
+   * asset caches (transcripts, visual fingerprints) merged back onto their
+   * assets, so a saved .aive file is self-contained.
+   */
+  private serializableProject(): Project {
+    return {
+      ...this.project,
+      assets: this.project.assets.map((a) => {
+        const cache = this.assetCaches.get(a.id);
+        if (!cache?.transcript && !cache?.visualSig) return a;
+        return { ...a, ...(cache.transcript ? { transcript: cache.transcript } : {}), ...(cache.visualSig ? { visualSig: cache.visualSig } : {}) };
+      }),
+    };
+  }
+
+  private async writeRecoverySnapshot(): Promise<void> {
+    if (!this.isDirty() || !this.hasContent()) return;
+    const dir = join(this.dataDir, "autosave");
+    await mkdir(dir, { recursive: true });
+    const path = join(dir, "current.aive.recovery");
+    // Plain project JSON so load_project can open it directly; the original
+    // .aive path (if any) rides in a sidecar meta file.
+    await writeFile(path, JSON.stringify(this.serializableProject(), null, 2), "utf8");
+    await writeFile(
+      join(dir, "current.aive.recovery.meta.json"),
+      JSON.stringify({ originalPath: this.currentPath ?? null, savedAt: Date.now() }, null, 2),
+      "utf8",
+    );
+    this.recoveryPath = path;
+  }
+
+  private async clearRecoverySnapshot(): Promise<void> {
+    if (this.recoveryTimer) {
+      clearTimeout(this.recoveryTimer);
+      this.recoveryTimer = null;
+    }
+    const dir = join(this.dataDir, "autosave");
+    await rm(join(dir, "current.aive.recovery"), { force: true }).catch(() => {});
+    await rm(join(dir, "current.aive.recovery.meta.json"), { force: true }).catch(() => {});
+    this.recoveryPath = null;
   }
 
   // ---- typed event helpers ---------------------------------------------------
@@ -275,6 +374,46 @@ export class EditorEngine extends EventEmitter {
     const asset = this.project.assets.find((a) => a.id === assetId);
     if (!asset) throw new Error(`No asset with id "${assetId}"`);
     return asset;
+  }
+
+  /** The asset behind a clip, or undefined for an ADJUSTMENT layer (no source). */
+  clipAsset(clip: Clip): MediaAsset | undefined {
+    return clip.assetId ? this.project.assets.find((a) => a.id === clip.assetId) : undefined;
+  }
+
+  /** The clip's source asset, or a teaching error when it's an adjustment layer. */
+  private requireClipAsset(clip: Clip, what: string): MediaAsset {
+    if (clip.adjustment || !clip.assetId) {
+      throw new Error(
+        `Clip "${clip.id}" is an ADJUSTMENT layer — it has no source media, so ${what} doesn't apply. Target a footage clip instead (adjustment layers take color/effect tools only).`,
+      );
+    }
+    return this.getAsset(clip.assetId);
+  }
+
+  /**
+   * Security allowlist for the HTTP /file endpoint. A path is servable only if
+   * it lives under the engine's data dir (previews/proxies/frames/baked/
+   * thumbnails/scopes/…) or is the source/proxy/preview file of an imported
+   * asset. Everything else — including `..` traversal attempts, which
+   * path.resolve collapses before comparison — is rejected, so the server can
+   * never be used to read arbitrary files on disk.
+   */
+  isServablePath(p: string): boolean {
+    const norm = (s: string): string => {
+      const r = resolve(s);
+      // Windows paths are case-insensitive; compare them case-folded.
+      return process.platform === "win32" ? r.toLowerCase() : r;
+    };
+    const target = norm(p);
+    const dataRoot = norm(this.dataDir);
+    if (target === dataRoot || target.startsWith(dataRoot + sep)) return true;
+    for (const a of this.project.assets) {
+      for (const candidate of [a.path, a.proxyPath, a.previewPath]) {
+        if (candidate && norm(candidate) === target) return true;
+      }
+    }
+    return false;
   }
 
   /** Video tracks, bottom→top (ascending stacking index). */
@@ -408,9 +547,15 @@ export class EditorEngine extends EventEmitter {
     });
     // Large/4K sources: build a low-res preview proxy in the BACKGROUND so import
     // returns immediately and scrubbing stays smooth. Export still uses the
-    // original. Fire-and-forget; failures are non-fatal.
+    // original. Fire-and-forget, but failures are RECORDED on the asset
+    // (proxyError) so the state shows why scrubbing stayed slow.
     if (asset.hasVideo && Math.max(asset.width, asset.height) > PROXY_TRIGGER_LONG_EDGE) {
-      void this.generateProxy(asset.id).catch(() => {});
+      void this.generateProxy(asset.id).catch((err) => {
+        this.mutate(() => {
+          const a = this.project.assets.find((x) => x.id === asset.id);
+          if (a) a.proxyError = err instanceof Error ? err.message : String(err);
+        });
+      });
     }
     return asset;
   }
@@ -423,25 +568,29 @@ export class EditorEngine extends EventEmitter {
   async generateProxy(assetId: string, longEdge = PROXY_LONG_EDGE): Promise<MediaAsset> {
     const asset = this.getAsset(assetId);
     if (!asset.hasVideo) throw new Error("Asset has no video to proxy");
-    const dir = join(this.dataDir, "proxies");
-    await mkdir(dir, { recursive: true });
-    const out = join(dir, `${assetId}.mp4`);
-    if (!(await fileExists(out))) {
-      // Scale the long edge down to `longEdge`, keep aspect, even dims; fast preset.
-      const scale = asset.width >= asset.height
-        ? `scale=${longEdge}:-2`
-        : `scale=-2:${longEdge}`;
-      const args = ["-hide_banner", "-i", asset.path, "-vf", scale, "-c:v", "libx264", "-preset", "veryfast", "-crf", "28", "-pix_fmt", "yuv420p"];
-      if (asset.hasAudio) args.push("-c:a", "aac", "-b:a", "128k");
-      else args.push("-an");
-      args.push("-movflags", "+faststart", "-y", out);
-      await runFfmpeg(args);
-    }
-    return this.mutate(() => {
-      const a = this.getAsset(assetId);
-      a.proxyPath = out;
-      return a;
+    const { promise } = this.jobs.start("proxy", `Proxy ${asset.name}`, async (signal, onProgress) => {
+      const dir = join(this.dataDir, "proxies");
+      await mkdir(dir, { recursive: true });
+      const out = join(dir, `${assetId}.mp4`);
+      if (!(await fileExists(out))) {
+        // Scale the long edge down to `longEdge`, keep aspect, even dims; fast preset.
+        const scale = asset.width >= asset.height
+          ? `scale=${longEdge}:-2`
+          : `scale=-2:${longEdge}`;
+        const args = ["-hide_banner", "-i", asset.path, "-vf", scale, "-c:v", "libx264", "-preset", "veryfast", "-crf", "28", "-pix_fmt", "yuv420p"];
+        if (asset.hasAudio) args.push("-c:a", "aac", "-b:a", "128k");
+        else args.push("-an");
+        args.push("-movflags", "+faststart", "-y", out);
+        await runFfmpeg(args, { signal, totalDuration: asset.duration, onProgress });
+      }
+      return this.mutate(() => {
+        const a = this.getAsset(assetId);
+        a.proxyPath = out;
+        delete a.proxyError;
+        return a;
+      });
     });
+    return promise;
   }
 
   removeAsset(assetId: string): void {
@@ -453,6 +602,9 @@ export class EditorEngine extends EventEmitter {
       }
       if (this.project.music?.assetId === assetId) delete this.project.music;
     });
+    // The cache entry is deliberately KEPT: it lives outside the undo history,
+    // so an undo of this removal restores the asset with its transcript/visual
+    // index intact. Entries are dropped wholesale on reset()/load().
   }
 
   /** Set background music (mixed under the whole timeline). volume default 0.3. */
@@ -607,6 +759,37 @@ export class EditorEngine extends EventEmitter {
   }
 
   /**
+   * Place an ADJUSTMENT layer: a source-less clip whose color grade + effects
+   * apply to the composite of every video track BELOW it while it's active.
+   * Defaults to the TOPMOST video track (so it grades everything).
+   */
+  addAdjustmentClip(opts: { trackIndex?: number; startFrame: number; durationFrames: number }): Clip {
+    return this.mutate(() => {
+      const videoTracks = this.videoTracks();
+      const track =
+        opts.trackIndex === undefined
+          ? videoTracks[videoTracks.length - 1]
+          : this.trackByIndex(opts.trackIndex);
+      if (!track || track.kind !== "video") {
+        throw new Error(
+          `Adjustment layers live on VIDEO tracks (they grade the picture below). Track ${opts.trackIndex} is ${track ? track.kind : "missing"} — pass a video trackIndex or omit it for the top video track.`,
+        );
+      }
+      const durationFrames = Math.max(MIN_CLIP_FRAMES, Math.round(opts.durationFrames));
+      const clip: Clip = {
+        id: newId("clip"),
+        adjustment: true,
+        startFrame: Math.max(0, Math.round(opts.startFrame)),
+        sourceInFrame: 0,
+        sourceOutFrame: durationFrames,
+      };
+      track.clips.push(clip);
+      EditorEngine.sortTrack(track);
+      return clip;
+    });
+  }
+
+  /**
    * Insert a clip at a frame on a track, rippling later clips on that track to
    * the right by the inserted footprint so nothing is overwritten.
    */
@@ -629,8 +812,10 @@ export class EditorEngine extends EventEmitter {
   trimClip(clipId: string, sourceInFrame?: number, sourceOutFrame?: number): Clip {
     return this.mutate(() => {
       const { track, clip } = this.findClip(clipId);
-      const asset = this.getAsset(clip.assetId);
-      const assetFrames = Math.max(MIN_CLIP_FRAMES, Math.round(asset.duration * this.project.fps));
+      // An adjustment layer has no source bounds — its "trim" just resizes the window.
+      const assetFrames = clip.adjustment
+        ? Number.MAX_SAFE_INTEGER
+        : Math.max(MIN_CLIP_FRAMES, Math.round(this.requireClipAsset(clip, "trimming source frames").duration * this.project.fps));
       const newIn = sourceInFrame === undefined ? clip.sourceInFrame : clamp(Math.round(sourceInFrame), 0, assetFrames - MIN_CLIP_FRAMES);
       const newOut = sourceOutFrame === undefined ? clip.sourceOutFrame : clamp(Math.round(sourceOutFrame), newIn + MIN_CLIP_FRAMES, assetFrames);
       if (newOut - newIn < MIN_CLIP_FRAMES) throw new Error("Trim would make the clip too short");
@@ -811,27 +996,32 @@ export class EditorEngine extends EventEmitter {
    * since the overlap they encoded no longer holds.
    */
   moveClip(clipId: string, startFrame: number, trackIndex?: number): void {
+    this.mutate(() => this.moveClipNoMutate(clipId, startFrame, trackIndex));
+  }
+
+  /** Move several clips at once (each to an absolute track+frame) as ONE undo step. */
+  moveClips(moves: { clipId: string; startFrame: number; trackIndex?: number }[]): void {
     this.mutate(() => {
-      const { clip, track } = this.findClip(clipId);
-      const delta = Math.max(0, Math.round(startFrame)) - clip.startFrame;
-      const dest = trackIndex === undefined ? track : this.trackByIndex(trackIndex);
-      const group = this.linkedClips(clip);
-      for (const member of group) {
-        const loc = this.findClip(member.id);
-        member.startFrame = Math.max(0, member.startFrame + delta);
-        delete member.transition;
-        if (member.id === clipId && dest.id !== loc.track.id) {
-          loc.track.clips.splice(loc.index, 1);
-          dest.clips.push(member);
-        }
-      }
-      for (const t of this.project.tracks) EditorEngine.sortTrack(t);
+      for (const m of moves) this.moveClipNoMutate(m.clipId, m.startFrame, m.trackIndex);
     });
   }
 
-  /** Move several clips at once (each to an absolute track+frame). */
-  moveClips(moves: { clipId: string; startFrame: number; trackIndex?: number }[]): void {
-    for (const m of moves) this.moveClip(m.clipId, m.startFrame, m.trackIndex);
+  /** The body of moveClip without the undo/mutate wrapper (shared by moveClip/moveClips). */
+  private moveClipNoMutate(clipId: string, startFrame: number, trackIndex?: number): void {
+    const { clip, track } = this.findClip(clipId);
+    const delta = Math.max(0, Math.round(startFrame)) - clip.startFrame;
+    const dest = trackIndex === undefined ? track : this.trackByIndex(trackIndex);
+    const group = this.linkedClips(clip);
+    for (const member of group) {
+      const loc = this.findClip(member.id);
+      member.startFrame = Math.max(0, member.startFrame + delta);
+      delete member.transition;
+      if (member.id === clipId && dest.id !== loc.track.id) {
+        loc.track.clips.splice(loc.index, 1);
+        dest.clips.push(member);
+      }
+    }
+    for (const t of this.project.tracks) EditorEngine.sortTrack(t);
   }
 
   /** Link clips so they move/trim/split/delete together. Returns the group id. */
@@ -1012,33 +1202,412 @@ export class EditorEngine extends EventEmitter {
     const asset = this.getAsset(assetId);
     if (!asset.hasAudio) throw new Error("Asset has no audio to transcribe");
 
-    const dir = join(this.dataDir, "transcripts");
-    await mkdir(dir, { recursive: true });
-    const wav = join(dir, `${assetId}.wav`);
-    await runFfmpeg(["-hide_banner", "-i", asset.path, "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", "-y", wav]);
+    const { promise } = this.jobs.start("transcribe", `Transcribe ${asset.name}`, async (signal) => {
+      const dir = join(this.dataDir, "transcripts");
+      await mkdir(dir, { recursive: true });
+      const wav = join(dir, `${assetId}.wav`);
+      await runFfmpeg(["-hide_banner", "-i", asset.path, "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", "-y", wav], { signal });
 
-    const model = opts.model ?? DEFAULT_MODEL;
-    const cues: TranscriptCue[] = await transcribe(wav, { model, language: opts.language });
-    const transcript: AssetTranscript = {
-      segments: cues.map((c) => ({ start: c.start, end: c.end, text: c.text })),
-      model,
-      language: opts.language ?? "en",
-    };
-    const updated = this.mutate(() => {
-      this.getAsset(assetId).transcript = transcript;
-      return this.getAsset(assetId);
+      const model = opts.model ?? DEFAULT_MODEL;
+      let result: Awaited<ReturnType<typeof transcribeFull>>;
+      try {
+        result = await transcribeFull(wav, { model, language: opts.language });
+      } finally {
+        // The 16kHz WAV is only whisper's input — delete it as soon as
+        // transcription settles instead of letting it pile up on disk.
+        await rm(wav, { force: true }).catch(() => {});
+      }
+      if (signal.aborted) throw new Error("Transcription canceled");
+      const transcript: AssetTranscript = {
+        segments: result.cues.map((c) => ({ start: c.start, end: c.end, text: c.text })),
+        words: result.words,
+        model,
+        language: opts.language ?? "en",
+      };
+      // Heavy data → engine cache (outside undo); the project only gets a marker.
+      this.setCachedTranscript(assetId, transcript);
+      const updated = this.mutate(() => {
+        this.getAsset(assetId).transcriptIndexed = true;
+        return this.getAsset(assetId);
+      });
+      return { asset: updated, segmentCount: transcript.segments.length, wordCount: transcript.words?.length ?? 0 };
     });
-    return { asset: updated, segmentCount: transcript.segments.length };
+    return promise;
+  }
+
+  // ---- asset-cache accessors (transcript / visual index live outside undo) ---
+  private setCachedTranscript(assetId: string, transcript: AssetTranscript): void {
+    const entry = this.assetCaches.get(assetId) ?? {};
+    entry.transcript = transcript;
+    this.assetCaches.set(assetId, entry);
+  }
+
+  private setCachedVisualSig(assetId: string, sig: VisualSignature): void {
+    const entry = this.assetCaches.get(assetId) ?? {};
+    entry.visualSig = sig;
+    this.assetCaches.set(assetId, entry);
+  }
+
+  private cachedTranscript(assetId: string): AssetTranscript | undefined {
+    return this.assetCaches.get(assetId)?.transcript;
+  }
+
+  private cachedVisualSig(assetId: string): VisualSignature | undefined {
+    return this.assetCaches.get(assetId)?.visualSig;
+  }
+
+  /** Assets with their cached transcript re-attached (for the pure ranking fn). */
+  private assetsWithTranscripts(): MediaAsset[] {
+    return this.project.assets.map((a) => {
+      const t = this.cachedTranscript(a.id);
+      return t ? { ...a, transcript: t } : a;
+    });
   }
 
   /** Rank spoken-word hits across all INDEXED asset transcripts for a query. */
   searchTranscript(query: string, limit = 20): TranscriptHit[] {
-    return rankTranscript(this.project.assets, query, limit);
+    return rankTranscript(this.assetsWithTranscripts(), query, limit);
   }
 
   /** The cached transcript of an asset (segments in seconds), or null if not indexed. */
   getTranscript(assetId: string): AssetTranscript | null {
-    return this.getAsset(assetId).transcript ?? null;
+    this.getAsset(assetId); // teaches on a bad id
+    return this.cachedTranscript(assetId) ?? null;
+  }
+
+  // ---- text-based editing (the words ARE the edit surface) -------------------
+
+  /** Words of an asset's transcript, or a teaching error if not indexed with words. */
+  private requireWords(assetId: string): TranscriptWord[] {
+    this.getAsset(assetId);
+    const words = this.cachedTranscript(assetId)?.words;
+    if (!words?.length) {
+      throw new Error(
+        `Asset "${assetId}" has no word-level transcript. Run index_transcript on it first (word timestamps are built automatically), then read the numbered words with get_transcript.`,
+      );
+    }
+    return words;
+  }
+
+  /** Merge overlapping/adjacent [start,end) second ranges (sorted output). */
+  private static mergeSecondRanges(ranges: { start: number; end: number }[]): { start: number; end: number }[] {
+    const sorted = ranges
+      .filter((r) => r.end > r.start)
+      .sort((a, b) => a.start - b.start);
+    const out: { start: number; end: number }[] = [];
+    for (const r of sorted) {
+      const last = out[out.length - 1];
+      if (last && r.start <= last.end) last.end = Math.max(last.end, r.end);
+      else out.push({ ...r });
+    }
+    return out;
+  }
+
+  /**
+   * Map SOURCE-second ranges of one asset onto absolute timeline frame ranges
+   * across the given placed clips (speed-aware; clamped to each clip's source
+   * window; ±padFrames of breathing room; merged per track). The same math as
+   * locateInTimeline, pointed at cutting instead of seeking.
+   */
+  private sourceRangesToTimelineRanges(
+    clips: { clip: Clip; trackIndex: number }[],
+    ranges: { start: number; end: number }[],
+    padFrames = 0,
+  ): { trackIndex: number; startFrame: number; endFrame: number }[] {
+    const fps = this.project.fps;
+    const raw: { trackIndex: number; startFrame: number; endFrame: number }[] = [];
+    for (const { clip, trackIndex } of clips) {
+      const speed = clip.effects?.speed ?? 1;
+      const inSec = clip.sourceInFrame / fps;
+      const outSec = clip.sourceOutFrame / fps;
+      const clipStart = clip.startFrame;
+      const clipEnd = clipEndFrame(clip);
+      for (const r of ranges) {
+        const s = Math.max(r.start, inSec);
+        const e = Math.min(r.end, outSec);
+        if (e <= s) continue;
+        let startFrame = clip.startFrame + Math.round(((s - inSec) / speed) * fps) - padFrames;
+        let endFrame = clip.startFrame + Math.round(((e - inSec) / speed) * fps) + padFrames;
+        startFrame = Math.max(clipStart, startFrame);
+        endFrame = Math.min(clipEnd, endFrame);
+        if (endFrame > startFrame) raw.push({ trackIndex, startFrame, endFrame });
+      }
+    }
+    // Merge overlaps per track so one ripple pass sees clean ranges.
+    const byTrack = new Map<number, { startFrame: number; endFrame: number }[]>();
+    for (const r of raw) {
+      (byTrack.get(r.trackIndex) ?? byTrack.set(r.trackIndex, []).get(r.trackIndex)!).push(r);
+    }
+    const merged: { trackIndex: number; startFrame: number; endFrame: number }[] = [];
+    for (const [trackIndex, list] of byTrack) {
+      list.sort((a, b) => a.startFrame - b.startFrame);
+      for (const r of list) {
+        const last = merged.filter((m) => m.trackIndex === trackIndex).pop();
+        if (last && r.startFrame <= last.endFrame) last.endFrame = Math.max(last.endFrame, r.endFrame);
+        else merged.push({ trackIndex, ...r });
+      }
+    }
+    return merged;
+  }
+
+  /**
+   * TEXT-BASED EDITING: delete word ranges from every placed clip of an asset.
+   * Word indices come from get_transcript's numbered words. Ranges are mapped
+   * to absolute timeline frames (speed-aware), merged, then removed in ONE
+   * ripple pass (a single undo step). Returns what was cut.
+   */
+  deleteTranscriptRanges(
+    assetId: string,
+    wordRanges: { fromWord: number; toWord: number }[],
+    padFrames = 0,
+  ): {
+    cuts: number;
+    framesRemoved: number;
+    removedText: string[];
+    ranges: { trackIndex: number; startFrame: number; endFrame: number }[];
+  } {
+    const words = this.requireWords(assetId);
+    const secondRanges: { start: number; end: number }[] = [];
+    const removedText: string[] = [];
+    for (const r of wordRanges) {
+      const from = Math.min(r.fromWord, r.toWord);
+      const to = Math.max(r.fromWord, r.toWord);
+      if (from < 0 || to >= words.length) {
+        throw new Error(
+          `Word range [${r.fromWord}, ${r.toWord}] is out of bounds — this transcript has words 0..${words.length - 1}. Read them with get_transcript.`,
+        );
+      }
+      secondRanges.push({ start: words[from].start, end: words[to].end });
+      removedText.push(words.slice(from, to + 1).map((w) => w.text).join(" "));
+    }
+    const merged = EditorEngine.mergeSecondRanges(secondRanges);
+
+    const placed: { clip: Clip; trackIndex: number }[] = [];
+    for (const track of this.project.tracks) {
+      for (const clip of track.clips) if (clip.assetId === assetId) placed.push({ clip, trackIndex: track.index });
+    }
+    if (placed.length === 0) {
+      throw new Error(
+        `Asset "${assetId}" has no clips on the timeline — there is nothing to cut. Place it first (add_clip), or use this after building the timeline.`,
+      );
+    }
+
+    const timelineRanges = this.sourceRangesToTimelineRanges(placed, merged, padFrames);
+    if (timelineRanges.length === 0) {
+      return { cuts: 0, framesRemoved: 0, removedText, ranges: [] };
+    }
+    this.rippleDeleteRanges(timelineRanges);
+    const framesRemoved = timelineRanges.reduce((n, r) => n + (r.endFrame - r.startFrame), 0);
+    return { cuts: timelineRanges.length, framesRemoved, removedText, ranges: timelineRanges };
+  }
+
+  /** Default filler vocabulary for tightenTalk (normalized, lowercase). */
+  private static readonly DEFAULT_FILLERS = ["um", "uh", "uhm", "erm", "er", "hmm", "mhm", "mm"];
+
+  /**
+   * ONE-CALL talking-head cleanup: remove filler words and shrink long pauses
+   * in a clip, via word-level transcript timings, as a single ripple pass /
+   * undo step. Auto-transcribes the asset if needed. Linked clips (detached
+   * audio) are cut at the same timeline ranges so they stay in sync.
+   */
+  async tightenTalk(
+    clipId: string,
+    opts: { removeFillers?: boolean; fillerWords?: string[]; maxPauseSec?: number; padFrames?: number } = {},
+  ): Promise<{
+    removed: { type: "filler" | "pause"; text?: string; start: number; end: number }[];
+    cuts: number;
+    framesRemoved: number;
+    oldDurationFrames: number;
+    newDurationFrames: number;
+  }> {
+    const { clip, track } = this.findClip(clipId);
+    const asset = this.requireClipAsset(clip, "tighten_talk");
+    if (!asset.hasAudio) {
+      throw new Error("This clip's source has no audio — tighten_talk needs speech. Pick a talking clip.");
+    }
+
+    if (!this.cachedTranscript(asset.id)?.words?.length) {
+      await this.indexTranscript(asset.id);
+    }
+    const words = this.requireWords(asset.id);
+
+    const fps = this.project.fps;
+    const inSec = clip.sourceInFrame / fps;
+    const outSec = clip.sourceOutFrame / fps;
+    const inWindow = words.filter((w) => w.end > inSec && w.start < outSec);
+    if (inWindow.length === 0) {
+      throw new Error(
+        "No transcribed words fall inside this clip's source range — nothing to tighten. Check the clip covers the spoken part (get_transcript shows word times).",
+      );
+    }
+
+    const normalize = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}']/gu, "");
+    const fillers = new Set((opts.fillerWords ?? EditorEngine.DEFAULT_FILLERS).map(normalize));
+    const maxPauseSec = opts.maxPauseSec ?? 1.0;
+    const padFrames = opts.padFrames ?? 1;
+    const removeFillers = opts.removeFillers ?? true;
+
+    const removed: { type: "filler" | "pause"; text?: string; start: number; end: number }[] = [];
+
+    if (removeFillers) {
+      for (let i = 0; i < inWindow.length; i++) {
+        const w = inWindow[i];
+        const norm = normalize(w.text);
+        const prevGap = i === 0 ? Infinity : w.start - inWindow[i - 1].end;
+        const nextGap = i === inWindow.length - 1 ? Infinity : inWindow[i + 1].start - w.end;
+        if (fillers.has(norm)) {
+          removed.push({ type: "filler", text: w.text, start: w.start, end: w.end });
+        } else if (norm === "like" && prevGap >= 0.25 && nextGap >= 0.25) {
+          // "like" is only a filler when isolated by pauses on both sides.
+          removed.push({ type: "filler", text: w.text, start: w.start, end: w.end });
+        } else if (norm === "you" && i + 1 < inWindow.length && normalize(inWindow[i + 1].text) === "know") {
+          removed.push({ type: "filler", text: `${w.text} ${inWindow[i + 1].text}`, start: w.start, end: inWindow[i + 1].end });
+          i++; // consume "know"
+        }
+      }
+    }
+
+    // Long pauses between consecutive words → shrink, leaving half of
+    // maxPauseSec of natural air (centered).
+    for (let i = 1; i < inWindow.length; i++) {
+      const gap = inWindow[i].start - inWindow[i - 1].end;
+      if (gap > maxPauseSec) {
+        const air = maxPauseSec / 2;
+        removed.push({
+          type: "pause",
+          start: inWindow[i - 1].end + air / 2,
+          end: inWindow[i].start - air / 2,
+        });
+      }
+    }
+
+    if (removed.length === 0) {
+      return { removed: [], cuts: 0, framesRemoved: 0, oldDurationFrames: clipDurationFrames(clip), newDurationFrames: clipDurationFrames(clip) };
+    }
+
+    const merged = EditorEngine.mergeSecondRanges(removed.map((r) => ({ start: r.start, end: r.end })));
+    // Cut this clip AND its linked members (same absolute ranges → stays in sync).
+    const primaryRanges = this.sourceRangesToTimelineRanges([{ clip, trackIndex: track.index }], merged, padFrames);
+    const allRanges = [...primaryRanges];
+    for (const member of this.linkedClips(clip)) {
+      if (member.id === clip.id) continue;
+      const memberTrack = this.findClip(member.id).track;
+      for (const r of primaryRanges) {
+        allRanges.push({ trackIndex: memberTrack.index, startFrame: r.startFrame, endFrame: r.endFrame });
+      }
+    }
+
+    const oldDurationFrames = clipDurationFrames(clip);
+    if (allRanges.length) this.rippleDeleteRanges(allRanges);
+    const framesRemoved = primaryRanges.reduce((n, r) => n + (r.endFrame - r.startFrame), 0);
+
+    return {
+      removed: removed
+        .sort((a, b) => a.start - b.start)
+        .map((r) => ({ ...r, start: Number(r.start.toFixed(3)), end: Number(r.end.toFixed(3)) })),
+      cuts: primaryRanges.length,
+      framesRemoved,
+      oldDurationFrames,
+      newDurationFrames: oldDurationFrames - framesRemoved,
+    };
+  }
+
+  /**
+   * "Here's my script — assemble the cut": diff `keep` (the user's edited text)
+   * against the asset's word-level transcript (LCS on normalized words), then
+   * append one clip per kept span to the base video track, in order.
+   */
+  editByTranscript(
+    assetId: string,
+    keep: string,
+    padSec = 0.08,
+  ): {
+    clipsCreated: string[];
+    spans: { fromWord: number; toWord: number; text: string }[];
+    matchedWords: number;
+    keepWords: number;
+    startFrame: number;
+  } {
+    const words = this.requireWords(assetId);
+    const normalize = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}']/gu, "");
+    const a = words.map((w) => normalize(w.text));
+    const b = (keep.match(/[\p{L}\p{N}']+/gu) ?? []).map(normalize).filter(Boolean);
+    if (b.length === 0) {
+      throw new Error("`keep` contains no words. Pass the edited text you want to keep, in the order it should play.");
+    }
+    if (a.length * b.length > 4_000_000) {
+      throw new Error(
+        `Transcript (${a.length} words) × keep text (${b.length} words) is too large to diff in one call. Split the work: use get_transcript to pick word indices and delete_transcript_ranges instead.`,
+      );
+    }
+
+    // Classic LCS DP + backtrack → indices of transcript words that survive.
+    const n = a.length;
+    const m = b.length;
+    const dp: Uint32Array[] = Array.from({ length: n + 1 }, () => new Uint32Array(m + 1));
+    for (let i = n - 1; i >= 0; i--) {
+      for (let j = m - 1; j >= 0; j--) {
+        dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+      }
+    }
+    const keptIdx: number[] = [];
+    let i = 0;
+    let j = 0;
+    while (i < n && j < m) {
+      if (a[i] === b[j]) {
+        keptIdx.push(i);
+        i++;
+        j++;
+      } else if (dp[i + 1][j] >= dp[i][j + 1]) i++;
+      else j++;
+    }
+    if (keptIdx.length === 0) {
+      throw new Error(
+        "None of the keep text's words matched the transcript. Make sure `keep` quotes the transcript's actual wording (read it with get_transcript).",
+      );
+    }
+
+    // Group consecutive transcript indices into spans.
+    const spans: { fromWord: number; toWord: number }[] = [];
+    for (const idx of keptIdx) {
+      const last = spans[spans.length - 1];
+      if (last && idx === last.toWord + 1) last.toWord = idx;
+      else spans.push({ fromWord: idx, toWord: idx });
+    }
+
+    const fps = this.project.fps;
+    const startFrame = this.trackEndFrame(this.baseVideoTrack());
+    const created = this.mutate(() => {
+      const track = this.baseVideoTrack();
+      let cursor = this.trackEndFrame(track);
+      const ids: string[] = [];
+      for (const span of spans) {
+        const sIn = Math.max(0, words[span.fromWord].start - padSec);
+        const sOut = words[span.toWord].end + padSec;
+        const clip = this.makeClip(
+          assetId,
+          cursor,
+          Math.round(sIn * fps),
+          Math.round(sOut * fps),
+        );
+        track.clips.push(clip);
+        cursor = clipEndFrame(clip);
+        ids.push(clip.id);
+      }
+      EditorEngine.sortTrack(track);
+      return ids;
+    });
+
+    return {
+      clipsCreated: created,
+      spans: spans.map((s) => ({
+        ...s,
+        text: words.slice(s.fromWord, s.toWord + 1).map((w) => w.text).join(" "),
+      })),
+      matchedWords: keptIdx.length,
+      keepWords: m,
+      startFrame,
+    };
   }
 
   /**
@@ -1052,9 +1621,10 @@ export class EditorEngine extends EventEmitter {
     for (const track of this.project.tracks) {
       for (const clip of track.clips) {
         const asset = this.project.assets.find((a) => a.id === clip.assetId);
-        const segs = asset?.transcript?.segments;
-        if (!segs?.length) continue;
-        const hits = rankTranscript([asset!], query, 1000);
+        const transcript = asset ? this.cachedTranscript(asset.id) : undefined;
+        const segs = transcript?.segments;
+        if (!asset || !segs?.length) continue;
+        const hits = rankTranscript([{ ...asset, transcript }], query, 1000);
         const speed = clip.effects?.speed ?? 1;
         const inSec = clip.sourceInFrame / fps;
         const outSec = clip.sourceOutFrame / fps;
@@ -1080,8 +1650,19 @@ export class EditorEngine extends EventEmitter {
    * embedding; otherwise the perceptual fingerprint stands alone.
    */
   async indexVisual(assetId: string, count = 5): Promise<{ asset: MediaAsset; sampleCount: number; semantic: boolean }> {
+    const preAsset = this.getAsset(assetId);
+    if (!preAsset.hasVideo) throw new Error("Asset has no video to fingerprint");
+    const { promise } = this.jobs.start("index_visual", `Visual index ${preAsset.name}`, () =>
+      this.indexVisualRun(assetId, count),
+    );
+    return promise;
+  }
+
+  private async indexVisualRun(
+    assetId: string,
+    count: number,
+  ): Promise<{ asset: MediaAsset; sampleCount: number; semantic: boolean }> {
     const asset = this.getAsset(assetId);
-    if (!asset.hasVideo) throw new Error("Asset has no video to fingerprint");
     const sig = await buildSignature(asset.path, asset.duration, count);
     // Try to bring up the CLIP model (downloads once); if usable, add semantic
     // embeddings to each sample so this asset is text- and image-searchable.
@@ -1092,11 +1673,9 @@ export class EditorEngine extends EventEmitter {
         if (embed) sample.embed = embed;
       }
     }
-    const updated = this.mutate(() => {
-      this.getAsset(assetId).visualSig = sig;
-      return this.getAsset(assetId);
-    });
-    return { asset: updated, sampleCount: sig.samples.length, semantic };
+    // Heavy fingerprint → engine cache (outside undo history), no project mutation.
+    this.setCachedVisualSig(assetId, sig);
+    return { asset: this.getAsset(assetId), sampleCount: sig.samples.length, semantic };
   }
 
   /**
@@ -1126,10 +1705,10 @@ export class EditorEngine extends EventEmitter {
       const hits: Array<{ assetId: string; name: string; score: number; atSeconds: number }> = [];
       for (const asset of this.project.assets) {
         if (!asset.hasVideo) continue;
-        let sig = asset.visualSig as VisualSignature | undefined;
+        let sig = this.cachedVisualSig(asset.id);
         if (!sig || !sig.samples.some((s) => s.embed)) {
           await this.indexVisual(asset.id);
-          sig = this.getAsset(asset.id).visualSig as VisualSignature;
+          sig = this.cachedVisualSig(asset.id)!;
         }
         let best = -1;
         let bestT = 0;
@@ -1148,7 +1727,7 @@ export class EditorEngine extends EventEmitter {
     let refSrcSec: number;
     if (ref.clipId) {
       const { clip } = this.findClip(ref.clipId);
-      refAssetId = clip.assetId;
+      refAssetId = this.requireClipAsset(clip, "visual search by reference frame").id;
       const speed = clip.effects?.speed ?? 1;
       const local = Math.max(0, ref.atSeconds ?? 0);
       refSrcSec = clip.sourceInFrame / fps + local * speed;
@@ -1170,10 +1749,10 @@ export class EditorEngine extends EventEmitter {
     const hits: Array<{ assetId: string; name: string; score: number; atSeconds: number }> = [];
     for (const asset of this.project.assets) {
       if (!asset.hasVideo) continue;
-      let sig = asset.visualSig as VisualSignature | undefined;
+      let sig = this.cachedVisualSig(asset.id);
       if (!sig) {
         await this.indexVisual(asset.id);
-        sig = this.getAsset(asset.id).visualSig as VisualSignature;
+        sig = this.cachedVisualSig(asset.id)!;
       }
       let best = 0;
       let bestT = 0;
@@ -1200,8 +1779,8 @@ export class EditorEngine extends EventEmitter {
     const fps = this.project.fps;
     const { clip } = this.findClip(clipId);
     const { clip: ref } = this.findClip(referenceClipId);
-    const clipAsset = this.getAsset(clip.assetId);
-    const refAsset = this.getAsset(ref.assetId);
+    const clipAsset = this.requireClipAsset(clip, "audio sync");
+    const refAsset = this.requireClipAsset(ref, "audio sync");
 
     const result: AudioSyncResult = await findAudioOffset(refAsset.path, clipAsset.path);
     const offsetFrames = Math.round(result.offsetSeconds * fps);
@@ -1287,10 +1866,20 @@ export class EditorEngine extends EventEmitter {
     });
   }
 
-  /** Replace the timeline markers (frames). Deduped, sorted, non-negative integers. */
-  setMarkers(frames: number[]): void {
+  /**
+   * Replace the timeline markers. Accepts bare frame numbers (back-compat) or
+   * full Marker objects ({frame, name?, color?, note?}). Deduped by frame
+   * (later entries win), sorted, non-negative integer frames.
+   */
+  setMarkers(markers: (number | Marker)[]): void {
     this.mutate(() => {
-      const clean = [...new Set(frames.map((f) => Math.max(0, Math.round(f))))].sort((a, b) => a - b);
+      const byFrame = new Map<number, Marker>();
+      for (const m of markers) {
+        const marker: Marker = typeof m === "number" ? { frame: m } : { ...m };
+        marker.frame = Math.max(0, Math.round(marker.frame));
+        byFrame.set(marker.frame, marker);
+      }
+      const clean = [...byFrame.values()].sort((a, b) => a.frame - b.frame);
       if (clean.length) this.project.markers = clean;
       else delete this.project.markers;
     });
@@ -1327,7 +1916,9 @@ export class EditorEngine extends EventEmitter {
       if (this.project.music.fadeInFrames) this.project.music.fadeInFrames = sc(this.project.music.fadeInFrames);
       if (this.project.music.fadeOutFrames) this.project.music.fadeOutFrames = sc(this.project.music.fadeOutFrames);
     }
-    if (this.project.markers) this.project.markers = this.project.markers.map(sc);
+    if (this.project.markers) {
+      this.project.markers = this.project.markers.map((m) => ({ ...m, frame: sc(m.frame) }));
+    }
     this.project.fps = newFps;
   }
 
@@ -1365,8 +1956,42 @@ export class EditorEngine extends EventEmitter {
     const resolved: ResolvedRenderClip[] = [];
 
     for (const { track, clip } of all) {
-      const asset = this.getAsset(clip.assetId);
       const f2s = (f: number) => framesToSeconds(f, fps);
+
+      // ADJUSTMENT layer: no source input — resolve just its window + effects
+      // (color/grade/LUT/filters, applied to the stacked composite in graph.ts).
+      if (clip.adjustment) {
+        let adjEffects: ResolvedEffects | undefined;
+        const e = clip.effects;
+        if (e) {
+          adjEffects = { color: e.color, grade: e.grade, lut: e.lut, filters: e.filters };
+          if (adjEffects.lut) {
+            let name = lutMap.get(adjEffects.lut);
+            if (!name) {
+              name = `lut${lutIdx++}.cube`;
+              await copyFile(adjEffects.lut, join(work, name));
+              lutMap.set(adjEffects.lut, name);
+            }
+            adjEffects = { ...adjEffects, lut: name };
+          }
+        }
+        resolved.push({
+          path: "",
+          adjustment: true,
+          trackIndex: track.index,
+          showVideo: track.kind === "video" && !track.hidden,
+          startSec: f2s(clip.startFrame),
+          sourceIn: 0,
+          sourceSpan: f2s(clip.sourceOutFrame - clip.sourceInFrame),
+          outDuration: framesToSeconds(clipDurationFrames(clip), fps),
+          hasAudio: false,
+          muted: true,
+          effects: adjEffects,
+        });
+        continue;
+      }
+
+      const asset = this.getAsset(clip.assetId!);
 
       let effects: ResolvedEffects | undefined;
       if (clip.effects || clip.keyframes) {
@@ -1411,7 +2036,10 @@ export class EditorEngine extends EventEmitter {
         overlays = [];
         for (const ov of clip.overlays) {
           const textFile = `txt_${ov.id}.txt`;
-          await writeFile(join(work, textFile), ov.text, "utf8");
+          const dWrap = defaultTextStyle(this.project.height, ov.fontSize);
+          // Auto-wrap to the canvas (drawtext has no wrapping); explicit
+          // newlines in the author's text are respected as-is.
+          await writeFile(join(work, textFile), wrapText(ov.text, maxCharsPerLine(this.project.width, dWrap.fontSize)), "utf8");
           const d = defaultTextStyle(this.project.height, ov.fontSize);
           overlays.push({
             textFile,
@@ -1443,7 +2071,9 @@ export class EditorEngine extends EventEmitter {
         for (let i = 0; i < clip.captions.cues.length; i++) {
           const cue = clip.captions.cues[i];
           const textFile = `cap_${clip.id}_${i}.txt`;
-          await writeFile(join(work, textFile), cue.text, "utf8");
+          const dWrap = defaultTextStyle(this.project.height, st.fontSize);
+          // Same auto-wrap as overlays — imported SRT cues can be long lines.
+          await writeFile(join(work, textFile), wrapText(cue.text, maxCharsPerLine(this.project.width, dWrap.fontSize)), "utf8");
           const d = defaultTextStyle(this.project.height, st.fontSize);
           overlays.push({
             textFile,
@@ -1489,7 +2119,9 @@ export class EditorEngine extends EventEmitter {
       resolved.push({
         path: asset.path,
         trackIndex: track.index,
-        showVideo: track.kind === "video" && !track.hidden,
+        // An audio-only asset (wav/mp3) placed on a video track must never
+        // enter the video graph — its input has no [N:v] stream to consume.
+        showVideo: track.kind === "video" && !track.hidden && asset.hasVideo,
         startSec: f2s(clip.startFrame),
         sourceIn: f2s(clip.sourceInFrame),
         sourceSpan: f2s(clip.sourceOutFrame - clip.sourceInFrame),
@@ -1712,7 +2344,7 @@ export class EditorEngine extends EventEmitter {
     opts: { model?: WhisperModel; language?: string; maxLen?: number; style?: CaptionStyle } = {},
   ): Promise<{ clip: Clip; cueCount: number }> {
     const { clip } = this.findClip(clipId);
-    const asset = this.getAsset(clip.assetId);
+    const asset = this.requireClipAsset(clip, "caption transcription");
     if (!asset.hasAudio) throw new Error("Clip's source has no audio to transcribe");
 
     const fps = this.project.fps;
@@ -1745,7 +2377,13 @@ export class EditorEngine extends EventEmitter {
     ]);
 
     const model = opts.model ?? DEFAULT_MODEL;
-    const cues: TranscriptCue[] = await transcribe(wav, { model, language: opts.language, maxLen: opts.maxLen });
+    let cues: TranscriptCue[];
+    try {
+      cues = await transcribe(wav, { model, language: opts.language, maxLen: opts.maxLen });
+    } finally {
+      // The extracted WAV is only whisper's input — clean it up immediately.
+      await rm(wav, { force: true }).catch(() => {});
+    }
 
     // Source-span seconds -> clip-local frames (speed-adjusted), clamped.
     const localCues = cues
@@ -1773,6 +2411,73 @@ export class EditorEngine extends EventEmitter {
     });
   }
 
+  /**
+   * Write every placed clip's captions as ONE sidecar file (SRT or VTT) with
+   * ABSOLUTE timeline times: clip-local cue frames → clip.startFrame offset →
+   * seconds (speed is already baked into stored cue frames). Merged and sorted.
+   */
+  async exportCaptions(path: string, format?: "srt" | "vtt"): Promise<{ path: string; cueCount: number; format: string }> {
+    const fps = this.project.fps;
+    const fmt = format ?? (path.toLowerCase().endsWith(".vtt") ? "vtt" : "srt");
+    const cues: { start: number; end: number; text: string }[] = [];
+    for (const track of this.project.tracks) {
+      for (const clip of track.clips) {
+        for (const cue of clip.captions?.cues ?? []) {
+          cues.push({
+            start: framesToSeconds(clip.startFrame + cue.startFrame, fps),
+            end: framesToSeconds(clip.startFrame + cue.endFrame, fps),
+            text: cue.text,
+          });
+        }
+      }
+    }
+    if (cues.length === 0) {
+      throw new Error(
+        "No captions on the timeline to export. Generate them first (generate_captions on a clip) or import a sidecar with import_captions.",
+      );
+    }
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, fmt === "vtt" ? formatVtt(cues) : formatSrt(cues), "utf8");
+    return { path, cueCount: cues.length, format: fmt };
+  }
+
+  /**
+   * Attach a sidecar caption file (SRT/VTT) to a clip as its caption track
+   * (replaces existing captions). Cue times are ABSOLUTE timeline seconds and
+   * are converted to clip-local frames; cues outside the clip are dropped.
+   */
+  async importCaptions(clipId: string, path: string): Promise<{ clip: Clip; cueCount: number; dropped: number }> {
+    const { clip } = this.findClip(clipId);
+    const raw = await readFile(path, "utf8");
+    const isVtt = path.toLowerCase().endsWith(".vtt") || /^﻿?WEBVTT/.test(raw);
+    const parsed = isVtt ? parseVtt(raw) : parseSrt(raw);
+    if (parsed.length === 0) {
+      throw new Error(
+        `No cues found in "${basename(path)}". Expected SubRip (.srt) or WebVTT (.vtt) with hh:mm:ss,mmm --> hh:mm:ss,mmm timing lines.`,
+      );
+    }
+    const fps = this.project.fps;
+    const durFrames = clipDurationFrames(clip);
+    const local = parsed
+      .map((c) => ({
+        startFrame: clamp(secondsToFrames(c.start, fps) - clip.startFrame, 0, durFrames),
+        endFrame: clamp(secondsToFrames(c.end, fps) - clip.startFrame, 0, durFrames),
+        text: c.text,
+      }))
+      .filter((c) => c.endFrame > c.startFrame);
+    if (local.length === 0) {
+      throw new Error(
+        `All ${parsed.length} cues fall outside this clip's timeline window (frames ${clip.startFrame}..${clip.startFrame + durFrames}). Cue times are ABSOLUTE timeline seconds — pick the clip the captions belong to.`,
+      );
+    }
+    const updated = this.mutate(() => {
+      const { clip: target } = this.findClip(clipId);
+      target.captions = { cues: local, style: target.captions?.style };
+      return target;
+    });
+    return { clip: updated, cueCount: local.length, dropped: parsed.length - local.length };
+  }
+
   setCaptionStyle(clipId: string, style: Record<string, unknown>): Clip {
     return this.mutate(() => {
       const { clip } = this.findClip(clipId);
@@ -1793,70 +2498,300 @@ export class EditorEngine extends EventEmitter {
    * Render a fast, lower-resolution preview of the whole timeline. Cancels any
    * in-flight preview render. Returns the output file path.
    */
+  /**
+   * Render-cache instrumentation (read by smoke-cache): how many segments were
+   * re-encoded vs served from cache, and how often the single-pass path ran.
+   */
+  readonly renderStats = { segmentRenders: 0, segmentCacheHits: 0, singlePassRenders: 0 };
+
+  /** Full timeline extent in seconds (video + slipped audio), same math as graph.ts. */
+  private fullTimelineSeconds(staged: ResolvedRenderClip[]): number {
+    let total = 0;
+    for (const c of staged) {
+      total = Math.max(total, c.startSec + c.outDuration);
+      const aShift = c.audioOffset && c.audioOffset > 0 ? c.audioOffset : 0;
+      if (c.hasAudio) total = Math.max(total, c.startSec + aShift + c.outDuration);
+    }
+    return Math.max(total, 1 / this.project.fps);
+  }
+
+  /**
+   * Ensure one planned segment exists in the cache (render it if missing).
+   * Returns its path. Cache entries are video-only MPEG-TS at the preview
+   * canvas/profile; `hw` is the hardware encoder to try (falls back to sw).
+   */
+  private async ensureSegmentRendered(
+    staged: ResolvedRenderClip[],
+    cwd: string,
+    canvas: Canvas,
+    seg: PlannedSegment,
+    mtimes: Record<string, number>,
+    hw: string | null,
+    signal?: AbortSignal,
+  ): Promise<string> {
+    const dir = join(this.dataDir, "cache", "segments");
+    await mkdir(dir, { recursive: true });
+    const key = segmentKey(staged, seg, canvas, PREVIEW_PROFILE, mtimes, hw);
+    const path = join(dir, `${key}.ts`);
+    if (await fileExists(path)) {
+      this.renderStats.segmentCacheHits += 1;
+      // Touch for the GC's LRU ordering.
+      const now = new Date();
+      await utimes(path, now, now).catch(() => {});
+      return path;
+    }
+    const tmp = `${path}.tmp-${process.pid}`;
+    const render = (enc: string | null) =>
+      buildRenderCommand(staged, canvas, tmp, PREVIEW_PROFILE, undefined, undefined, {
+        window: seg,
+        videoOnly: true,
+        mpegts: true,
+        hwEncoder: enc,
+      });
+    try {
+      await runFfmpeg(render(hw).args, { cwd, signal });
+    } catch (err) {
+      if (signal?.aborted || !hw) throw err;
+      // A listed hardware encoder can still fail at runtime — retry software.
+      await runFfmpeg(render(null).args, { cwd, signal });
+    }
+    await rename(tmp, path);
+    this.renderStats.segmentRenders += 1;
+    return path;
+  }
+
+  /** Segment-cached preview: render only missing segments, concat, one audio pass. */
+  private async renderPreviewSegmented(
+    outPath: string,
+    signal: AbortSignal,
+    onProgress: (fraction: number) => void,
+  ): Promise<RenderResult> {
+    const canvas = previewCanvas(this.canvas);
+    const { clips: staged, cwd } = await this.stageRender();
+    const total = this.fullTimelineSeconds(staged);
+    const segments = planSegments(staged, total);
+    const mtimes = await collectMtimes(staged);
+    const hw = await pickHwEncoder("h264");
+
+    const segPaths: string[] = [];
+    for (let i = 0; i < segments.length; i++) {
+      if (signal.aborted) throw new Error("Preview render canceled");
+      segPaths.push(await this.ensureSegmentRendered(staged, cwd, canvas, segments[i], mtimes, hw, signal));
+      const f = ((i + 1) / segments.length) * 0.8;
+      onProgress(f);
+      this.emit("progress", { job: "preview", fraction: f });
+    }
+
+    // Concat list (bare ../-free absolute paths with forward slashes; keys are hex).
+    const listPath = join(this.dataDir, "cache", "segments", `concat-${Date.now()}.txt`);
+    await writeFile(listPath, segPaths.map((p) => `file '${p.replace(/\\/g, "/")}'`).join("\n"), "utf8");
+
+    // ONE cheap audio-only pass over the full timeline (mixing is fast).
+    const audioPath = `${outPath}.audio.m4a`;
+    const audio = buildRenderCommand(staged, canvas, audioPath, PREVIEW_PROFILE, this.resolveMusic(), undefined, {
+      audioOnly: true,
+    });
+    await runFfmpeg(audio.args, { cwd, signal, totalDuration: audio.totalDuration, onProgress: (f) => {
+      const g = 0.8 + f * 0.15;
+      onProgress(g);
+      this.emit("progress", { job: "preview", fraction: g });
+    } });
+
+    try {
+      // Lossless assembly: copy the concatenated video + the audio pass.
+      await runFfmpeg(
+        [
+          "-hide_banner",
+          "-f", "concat", "-safe", "0", "-i", listPath,
+          "-i", audioPath,
+          "-map", "0:v:0", "-map", "1:a:0",
+          "-c", "copy", "-movflags", "+faststart",
+          "-y", outPath,
+        ],
+        { signal },
+      );
+    } finally {
+      await rm(listPath, { force: true }).catch(() => {});
+      await rm(audioPath, { force: true }).catch(() => {});
+    }
+    onProgress(1);
+    this.emit("progress", { job: "preview", fraction: 1 });
+    return { path: outPath, duration: total };
+  }
+
   async renderPreview(): Promise<RenderResult> {
     if (this.clipCount() === 0) throw new Error("Timeline is empty — nothing to preview");
 
-    this.previewAbort?.abort();
-    const abort = new AbortController();
-    this.previewAbort = abort;
+    // A new preview supersedes any in-flight one (its job ends "canceled").
+    if (this.previewJobId) this.jobs.cancel(this.previewJobId);
 
-    const dir = join(this.dataDir, "previews");
-    await mkdir(dir, { recursive: true });
-    const outPath = join(dir, `preview-${this.project.revision}-${Date.now()}.mp4`);
+    const { job, promise } = this.jobs.start("preview", "Preview render", async (signal, onProgress) => {
+      const dir = join(this.dataDir, "previews");
+      await mkdir(dir, { recursive: true });
+      const outPath = join(dir, `preview-${this.project.revision}-${Date.now()}.mp4`);
 
-    const canvas = previewCanvas(this.canvas);
-    const { clips: staged, cwd } = await this.stageRender();
-    const { args, totalDuration } = buildRenderCommand(staged, canvas, outPath, PREVIEW_PROFILE, this.resolveMusic());
+      // Segment-cached path first (near-instant for small edits); single-pass
+      // fallback on any cache/concat error. AIVE_SEGMENT_CACHE=off disables.
+      if (process.env.AIVE_SEGMENT_CACHE !== "off") {
+        try {
+          const result = await this.renderPreviewSegmented(outPath, signal, onProgress);
+          this.previewCache = { projectId: this.project.id, revision: this.project.revision, path: outPath };
+          void pruneDataDir(this.dataDir).catch(() => {});
+          return result;
+        } catch (err) {
+          if (signal.aborted) throw err;
+          console.error(
+            `[aive] segment-cached preview failed (${err instanceof Error ? err.message : err}); falling back to single-pass`,
+          );
+        }
+      }
 
-    await runFfmpeg(args, {
-      cwd,
-      totalDuration,
-      signal: abort.signal,
-      onProgress: (fraction) => this.emit("progress", { job: "preview", fraction }),
+      const canvas = previewCanvas(this.canvas);
+      const { clips: staged, cwd } = await this.stageRender();
+      const hw = await pickHwEncoder("h264");
+      const build = (enc: string | null) =>
+        buildRenderCommand(staged, canvas, outPath, PREVIEW_PROFILE, this.resolveMusic(), undefined, { hwEncoder: enc });
+
+      const { args, totalDuration } = build(hw);
+      const run = (a: string[]) =>
+        runFfmpeg(a, {
+          cwd,
+          totalDuration,
+          signal,
+          onProgress: (fraction) => {
+            onProgress(fraction);
+            this.emit("progress", { job: "preview", fraction });
+          },
+        });
+      try {
+        await run(args);
+      } catch (err) {
+        if (signal.aborted || !hw) throw err;
+        await run(build(null).args); // hardware encoder failed at runtime → software
+      }
+      this.renderStats.singlePassRenders += 1;
+
+      this.previewCache = { projectId: this.project.id, revision: this.project.revision, path: outPath };
+      void pruneDataDir(this.dataDir).catch(() => {});
+      return { path: outPath, duration: totalDuration } satisfies RenderResult;
     });
-
-    this.previewCache = { revision: this.project.revision, path: outPath };
-    return { path: outPath, duration: totalDuration };
+    this.previewJobId = job.id;
+    return promise;
   }
 
   /**
    * Render a single composited frame of the whole timeline at `atSeconds` and
-   * return its PNG path. Reuses a cached full preview when the edit is unchanged.
+   * return its PNG path. Fast paths, in order: extract from a fresh cached full
+   * preview; render/reuse ONLY the cache segment containing `t` (near-instant
+   * verify loop); fall back to a full preview render.
    */
   async renderFrame(atSeconds?: number): Promise<string> {
     if (this.clipCount() === 0) throw new Error("Timeline is empty — nothing to show");
-
-    let preview = this.previewCache;
-    const fresh = preview && preview.revision === this.project.revision && (await fileExists(preview.path));
-    if (!fresh) {
-      const r = await this.renderPreview();
-      preview = { revision: this.project.revision, path: r.path };
-    }
 
     const total = this.timelineDuration();
     const t = Math.min(Math.max(0, atSeconds ?? total / 2), Math.max(0, total - 0.05));
     const dir = join(this.dataDir, "frames");
     await mkdir(dir, { recursive: true });
     const outPath = join(dir, `frame-${Date.now()}.png`);
-    await runFfmpeg(["-hide_banner", "-ss", t.toFixed(3), "-i", preview!.path, "-frames:v", "1", "-y", outPath]);
-    return outPath;
+
+    const extract = async (from: string, at: number, outputSeek = false) => {
+      // MPEG-TS segments have no seek index — input-side -ss can land nowhere
+      // and emit zero frames. Output-side seek decodes from the start instead
+      // (segments are ≤10s, so this stays cheap); mp4 previews keep the fast
+      // input-side seek.
+      const seek = ["-ss", Math.max(0, at).toFixed(3)];
+      const args = outputSeek
+        ? ["-hide_banner", "-i", from, ...seek, "-frames:v", "1", "-y", outPath]
+        : ["-hide_banner", ...seek, "-i", from, "-frames:v", "1", "-y", outPath];
+      await runFfmpeg(args);
+      return outPath;
+    };
+
+    const preview = this.previewCache;
+    const fresh =
+      preview &&
+      preview.projectId === this.project.id &&
+      preview.revision === this.project.revision &&
+      (await fileExists(preview.path));
+    if (fresh) return extract(preview!.path, t);
+
+    // No fresh preview: render just the ONE segment containing t (or reuse its
+    // cached file) instead of the whole timeline.
+    if (process.env.AIVE_SEGMENT_CACHE !== "off") {
+      try {
+        const canvas = previewCanvas(this.canvas);
+        const { clips: staged, cwd } = await this.stageRender();
+        const fullTotal = this.fullTimelineSeconds(staged);
+        const segments = planSegments(staged, fullTotal);
+        const seg = segments.find((s) => t >= s.start && t < s.end) ?? segments[segments.length - 1];
+        if (seg) {
+          const mtimes = await collectMtimes(staged);
+          const hw = await pickHwEncoder("h264");
+          const segPath = await this.ensureSegmentRendered(staged, cwd, canvas, seg, mtimes, hw);
+          return await extract(segPath, t - seg.start, true);
+        }
+      } catch (err) {
+        console.error(
+          `[aive] single-segment frame render failed (${err instanceof Error ? err.message : err}); falling back to full preview`,
+        );
+      }
+    }
+
+    const r = await this.renderPreview();
+    return extract(r.path, t);
   }
 
-  /** Render the final export to `outputPath` with optional encoding settings. */
+  /** Render the final export to `outputPath` with optional encoding settings (blocking). */
   async exportVideo(outputPath: string, settings?: ExportSettings): Promise<RenderResult> {
+    return this.startExportJob(outputPath, settings).promise;
+  }
+
+  /**
+   * Start an export as a cancelable JOB. Blocking callers await `.promise`;
+   * background callers keep `.job.id` and poll list_jobs / cancel_job. A
+   * canceled or failed export deletes its partial output file.
+   */
+  startExportJob(outputPath: string, settings?: ExportSettings): { job: Job; promise: Promise<RenderResult> } {
     if (this.clipCount() === 0) throw new Error("Timeline is empty — nothing to export");
 
-    await mkdir(dirname(outputPath), { recursive: true });
-    const { clips: staged, cwd } = await this.stageRender();
-    const { args, totalDuration } = buildRenderCommand(staged, this.canvas, outputPath, EXPORT_PROFILE, this.resolveMusic(), settings);
+    return this.jobs.start("export", `Export → ${basename(outputPath)}`, async (signal, onProgress) => {
+      await mkdir(dirname(outputPath), { recursive: true });
+      const { clips: staged, cwd } = await this.stageRender();
+      // Export defaults to SOFTWARE encoding for quality; `hardware: true` opts
+      // into NVENC/QSV/AMF/VideoToolbox for speed (with sw retry on failure).
+      const hw = settings?.hardware
+        ? await pickHwEncoder(settings.videoCodec === "h265" ? "h265" : "h264")
+        : null;
+      const build = (enc: string | null) =>
+        buildRenderCommand(staged, this.canvas, outputPath, EXPORT_PROFILE, this.resolveMusic(), settings, { hwEncoder: enc });
+      const { args, totalDuration } = build(hw);
 
-    await runFfmpeg(args, {
-      cwd,
-      totalDuration,
-      onProgress: (fraction) => this.emit("progress", { job: "export", fraction }),
+      const run = (a: string[]) =>
+        runFfmpeg(a, {
+          cwd,
+          totalDuration,
+          signal,
+          onProgress: (fraction) => {
+            onProgress(fraction);
+            this.emit("progress", { job: "export", fraction });
+          },
+        });
+      try {
+        try {
+          await run(args);
+        } catch (err) {
+          if (signal.aborted || !hw) throw err;
+          await run(build(null).args); // hardware encoder failed at runtime → software
+        }
+      } catch (err) {
+        // Don't leave a half-written file behind on cancel/failure.
+        await rm(outputPath, { force: true }).catch(() => {});
+        throw err;
+      }
+
+      void pruneDataDir(this.dataDir).catch(() => {});
+      return { path: outputPath, duration: totalDuration } satisfies RenderResult;
     });
-
-    return { path: outputPath, duration: totalDuration };
   }
 
   /** Generate a thumbnail JPEG for an asset at the given time. Returns its path. */
@@ -1887,7 +2822,20 @@ export class EditorEngine extends EventEmitter {
    */
   async stabilizeClip(clipId: string): Promise<Clip> {
     const { clip } = this.findClip(clipId);
-    const asset = this.getAsset(clip.assetId);
+    const asset = this.requireClipAsset(clip, "stabilization");
+    const { promise } = this.jobs.start("stabilize", `Stabilize ${asset.name}`, (signal, onProgress) =>
+      this.stabilizeClipRun(clipId, signal, onProgress),
+    );
+    return promise;
+  }
+
+  private async stabilizeClipRun(
+    clipId: string,
+    signal: AbortSignal,
+    onProgress: (fraction: number) => void,
+  ): Promise<Clip> {
+    const { clip } = this.findClip(clipId);
+    const asset = this.requireClipAsset(clip, "stabilization");
     const fps = this.project.fps;
     const sourceInSec = framesToSeconds(clip.sourceInFrame, fps);
     const spanSec = framesToSeconds(clip.sourceOutFrame - clip.sourceInFrame, fps);
@@ -1913,7 +2861,8 @@ export class EditorEngine extends EventEmitter {
         "null",
         "-",
       ],
-      { cwd: dir },
+      // Pass 1 (analysis) ≈ first half of the work.
+      { cwd: dir, signal, totalDuration: spanSec, onProgress: (f) => onProgress(f * 0.5) },
     );
 
     const pass2: string[] = [
@@ -1938,7 +2887,7 @@ export class EditorEngine extends EventEmitter {
     if (asset.hasAudio) pass2.push("-c:a", "aac", "-b:a", "192k");
     else pass2.push("-an");
     pass2.push("-movflags", "+faststart", "-y", outName);
-    await runFfmpeg(pass2, { cwd: dir });
+    await runFfmpeg(pass2, { cwd: dir, signal, totalDuration: spanSec, onProgress: (f) => onProgress(0.5 + f * 0.5) });
 
     const baked = await probeAsset(outPath);
     baked.name = `${asset.name} (stabilized)`;
@@ -1958,11 +2907,25 @@ export class EditorEngine extends EventEmitter {
     clipId: string,
     opts: { sampleFps?: number; smoothing?: number; scoreThreshold?: number } = {},
   ): Promise<{ clip: Clip; hitRate: number; cropWidth: number; cropHeight: number; keyframes: number }> {
-    const { clip } = this.findClip(clipId);
-    const asset = this.getAsset(clip.assetId);
-    if (!asset.hasVideo || asset.width <= 0 || asset.height <= 0) {
+    const { clip: pre } = this.findClip(clipId);
+    const preAsset = this.requireClipAsset(pre, "auto-reframe");
+    if (!preAsset.hasVideo || preAsset.width <= 0 || preAsset.height <= 0) {
       throw new Error("Auto-reframe needs a clip with a decodable video stream");
     }
+    const { promise } = this.jobs.start("reframe", `Auto-reframe ${preAsset.name}`, (signal, onProgress) =>
+      this.autoReframeRun(clipId, opts, signal, onProgress),
+    );
+    return promise;
+  }
+
+  private async autoReframeRun(
+    clipId: string,
+    opts: { sampleFps?: number; smoothing?: number; scoreThreshold?: number },
+    signal: AbortSignal,
+    onProgress: (fraction: number) => void,
+  ): Promise<{ clip: Clip; hitRate: number; cropWidth: number; cropHeight: number; keyframes: number }> {
+    const { clip } = this.findClip(clipId);
+    const asset = this.requireClipAsset(clip, "auto-reframe");
 
     const fps = this.project.fps;
     const srcW = asset.width;
@@ -1996,6 +2959,8 @@ export class EditorEngine extends EventEmitter {
       sampleFps: opts.sampleFps,
       scoreThreshold: opts.scoreThreshold,
     });
+    if (signal.aborted) throw new Error("Auto-reframe canceled");
+    onProgress(0.5); // tracking done; the bake reports the second half
     const keys = buildCropPlan(samples, { srcW, srcH, cropW, cropH, smoothing: opts.smoothing });
 
     const dir = join(this.dataDir, "baked");
@@ -2032,7 +2997,7 @@ export class EditorEngine extends EventEmitter {
     if (asset.hasAudio) bake.push("-c:a", "aac", "-b:a", "192k");
     else bake.push("-an");
     bake.push("-movflags", "+faststart", "-y", outName);
-    await runFfmpeg(bake, { cwd: dir });
+    await runFfmpeg(bake, { cwd: dir, signal, totalDuration: spanSec, onProgress: (f) => onProgress(0.5 + f * 0.5) });
 
     const baked = await probeAsset(outPath);
     baked.name = `${asset.name} (reframed ${outW}x${outH})`;
@@ -2068,6 +3033,25 @@ export class EditorEngine extends EventEmitter {
       opacity?: number;
       standalone?: boolean;
     },
+  ): Promise<{ graphic?: GraphicOverlay; clip: Clip; asset: MediaAsset }> {
+    const { promise } = this.jobs.start("graphic", "Render motion graphic", (signal) =>
+      this.addGraphicRun(clipId, opts, signal),
+    );
+    return promise;
+  }
+
+  private async addGraphicRun(
+    clipId: string | undefined,
+    opts: {
+      code: string;
+      props?: Record<string, unknown>;
+      durationSeconds?: number;
+      startFrame?: number;
+      endFrame?: number;
+      opacity?: number;
+      standalone?: boolean;
+    },
+    signal: AbortSignal,
   ): Promise<{ graphic?: GraphicOverlay; clip: Clip; asset: MediaAsset }> {
     const clip = clipId ? this.findClip(clipId).clip : undefined;
     const asNewClip = !clipId || !!opts.standalone;
@@ -2106,6 +3090,7 @@ export class EditorEngine extends EventEmitter {
       workDir,
     });
 
+    if (signal.aborted) throw new Error("Motion-graphic render canceled");
     const baked = await probeAsset(outPath);
     baked.name = `Motion graphic (${width}x${height})`;
 
@@ -2224,7 +3209,7 @@ export class EditorEngine extends EventEmitter {
    */
   async inspectClip(clipId: string, frameCount = 3): Promise<Record<string, unknown>> {
     const { track, clip } = this.findClip(clipId);
-    const asset = this.getAsset(clip.assetId);
+    const asset = this.requireClipAsset(clip, "inspect_clip");
     const fps = this.project.fps;
     const durationFrames = clipDurationFrames(clip);
     const startSec = framesToSeconds(clip.startFrame, fps);
@@ -2319,9 +3304,11 @@ export class EditorEngine extends EventEmitter {
     if (!this.project.name || this.project.name === "Untitled Project") {
       this.mutate(() => { this.project.name = basename(path).replace(/\.aive$/i, ""); });
     }
-    await writeFile(path, JSON.stringify(this.project, null, 2), "utf8");
+    await writeFile(path, JSON.stringify(this.serializableProject(), null, 2), "utf8");
     this.currentPath = path;
     this.lastSavedRevision = this.project.revision;
+    // The work is safely on disk — the crash-recovery snapshot is now stale.
+    await this.clearRecoverySnapshot();
     // Re-emit so clients pick up the new name / file path in the state envelope.
     this.emit("change", this.project);
   }
@@ -2335,6 +3322,20 @@ export class EditorEngine extends EventEmitter {
     this.undoStack = [];
     this.redoStack = [];
     this.project = migrateProject(loaded);
+    // Pull persisted transcripts/visual fingerprints OUT of the live project
+    // into the engine cache (kept outside the undo history); leave markers.
+    this.assetCaches.clear();
+    for (const a of this.project.assets) {
+      if (a.transcript || a.visualSig) {
+        this.assetCaches.set(a.id, {
+          ...(a.transcript ? { transcript: a.transcript } : {}),
+          ...(a.visualSig ? { visualSig: a.visualSig } : {}),
+        });
+        a.transcriptIndexed = !!a.transcript;
+        delete a.transcript;
+        delete a.visualSig;
+      }
+    }
     this.canvasAdopted = true;
     this.currentPath = path;
     this.project.revision += 1;
@@ -2343,12 +3344,71 @@ export class EditorEngine extends EventEmitter {
     return this.project;
   }
 
+  /**
+   * Write the project as an OpenTimelineIO (.otio) JSON file — the interchange
+   * handoff to Resolve/Premiere/Hiero/etc. SynthCut-specific data rides in
+   * metadata.synthcut so re-importing here is lossless.
+   */
+  async exportOtio(path: string): Promise<{ path: string; trackCount: number; clipCount: number }> {
+    const timeline = projectToOtio(this.serializableProject());
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, JSON.stringify(timeline, null, 2), "utf8");
+    return { path, trackCount: this.project.tracks.length, clipCount: this.clipCount() };
+  }
+
+  /**
+   * Load an OpenTimelineIO (.otio) JSON file as the CURRENT project. Referenced
+   * media is probed from disk; files that can't be found become offline
+   * placeholder assets (missing: true) so the structure survives and media can
+   * be relinked. Returns any structural warnings + the missing paths.
+   */
+  async importOtio(path: string): Promise<{ project: Project; warnings: string[]; missing: string[] }> {
+    const raw = await readFile(path, "utf8");
+    let json: unknown;
+    try {
+      json = JSON.parse(raw);
+    } catch {
+      throw new Error(`"${basename(path)}" is not valid JSON. OTIO files are plain JSON — check the export from the other tool.`);
+    }
+    const result = await otioToProject(json, async (mediaPath) => {
+      try {
+        return await probeAsset(mediaPath);
+      } catch {
+        return null;
+      }
+    });
+
+    this.undoStack = [];
+    this.redoStack = [];
+    this.project = migrateProject(result.project);
+    // Extract any transcripts/visual indexes that traveled in asset metadata.
+    this.assetCaches.clear();
+    for (const a of this.project.assets) {
+      if (a.transcript || a.visualSig) {
+        this.assetCaches.set(a.id, {
+          ...(a.transcript ? { transcript: a.transcript } : {}),
+          ...(a.visualSig ? { visualSig: a.visualSig } : {}),
+        });
+        a.transcriptIndexed = !!a.transcript;
+        delete a.transcript;
+        delete a.visualSig;
+      }
+    }
+    this.canvasAdopted = true;
+    this.currentPath = undefined; // an .otio import has no .aive home yet
+    this.project.revision += 1;
+    this.lastSavedRevision = this.project.revision;
+    this.emit("change", this.project);
+    return { project: this.project, warnings: result.warnings, missing: result.missing };
+  }
+
   /** Replace the entire project (used for "new project"). */
   reset(): void {
     this.undoStack = [];
     this.redoStack = [];
     this.canvasAdopted = false;
     this.currentPath = undefined;
+    this.assetCaches.clear();
     this.project = defaultProject();
     this.lastSavedRevision = this.project.revision;
     this.emit("change", this.project);
@@ -2363,6 +3423,20 @@ export class EditorEngine extends EventEmitter {
  */
 function migrateProject(loaded: Project): Project {
   if (loaded.schemaVersion === PROJECT_SCHEMA_VERSION) return loaded;
+
+  // v2 (or v1) → v3: bare marker frame numbers become Marker objects. Additive
+  // and order-preserving; runs for every pre-v3 project.
+  if (Array.isArray(loaded.markers)) {
+    loaded.markers = (loaded.markers as unknown as (number | Marker)[]).map((m) =>
+      typeof m === "number" ? { frame: m } : m,
+    );
+  }
+
+  if ((loaded.schemaVersion ?? 1) >= 2) {
+    // Already multi-track/frame-based — only the marker upgrade was needed.
+    loaded.schemaVersion = PROJECT_SCHEMA_VERSION;
+    return loaded;
+  }
 
   const fps = loaded.fps || 30;
   const s2f = (sec: number | undefined): number | undefined =>

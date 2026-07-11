@@ -20,9 +20,6 @@ import { join, isAbsolute, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { mkdtempSync, existsSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
-import { Readable } from "node:stream";
-import { pipeline } from "node:stream/promises";
-import { createWriteStream } from "node:fs";
 
 const DET = FaceDetector.inputSize;
 
@@ -49,14 +46,33 @@ async function main() {
   const dataDir = mkdtempSync(join(tmpdir(), "aive-reframe-"));
   const engine = new EditorEngine(dataDir);
 
-  // Resolve a face image (arg, or download one).
+  // Resolve a face image (arg, or download one). Sources can be flaky, so try
+  // each in turn and VALIDATE the payload is really a JPEG (magic bytes) —
+  // thispersondoesnotexist has been seen returning HTML.
   let face = process.argv[2] ? (isAbsolute(process.argv[2]) ? process.argv[2] : resolve(process.cwd(), process.argv[2])) : "";
   if (!face || !existsSync(face)) {
     face = join(dataDir, "face.jpg");
     console.log("0a. downloading a sample face image...");
-    const res = await fetch("https://thispersondoesnotexist.com/", { redirect: "follow" });
-    if (!res.ok || !res.body) throw new Error(`could not download a face image (${res.status})`);
-    await pipeline(Readable.fromWeb(res.body as Parameters<typeof Readable.fromWeb>[0]), createWriteStream(face));
+    const sources = [
+      "https://thispersondoesnotexist.com/",
+      // OpenCV's standard sample portrait (contains a clear frontal face).
+      "https://raw.githubusercontent.com/opencv/opencv/4.x/samples/data/lena.jpg",
+    ];
+    let got = false;
+    for (const url of sources) {
+      try {
+        const res = await fetch(url, { redirect: "follow" });
+        if (!res.ok) continue;
+        const buf = Buffer.from(await res.arrayBuffer());
+        if (buf.length < 1024 || buf[0] !== 0xff || buf[1] !== 0xd8) continue; // not a JPEG
+        await writeFile(face, buf);
+        got = true;
+        break;
+      } catch {
+        /* try next source */
+      }
+    }
+    if (!got) throw new Error("could not download a valid face image from any source — pass one: smoke-reframe.ts <face.jpg>");
   }
 
   console.log("0b. synthesize a 1920x1080 clip with a face sweeping left↔right...");

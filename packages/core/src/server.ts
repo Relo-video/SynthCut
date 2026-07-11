@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { randomBytes } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { stat, mkdir, writeFile } from "node:fs/promises";
 import { extname } from "node:path";
@@ -21,14 +22,22 @@ const CONTENT_TYPES: Record<string, string> = {
   ".mp3": "audio/mpeg",
 };
 
+/**
+ * CORS headers are emitted ONLY for requests that presented the valid session
+ * token (plus OPTIONS preflight). A hostile webpage cannot read the token (it
+ * lives in server.json on disk), so it can never receive a CORS-readable
+ * response — while the Electron renderer (file:// origin) and dev-vite pages,
+ * which DO hold the token, keep working. This replaces the old blanket
+ * `Access-Control-Allow-Origin: *`.
+ */
 function cors(res: ServerResponse): void {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Aive-Token");
 }
 
-function sendJson(res: ServerResponse, status: number, body: unknown): void {
-  cors(res);
+function sendJson(res: ServerResponse, status: number, body: unknown, withCors = true): void {
+  if (withCors) cors(res);
   const payload = JSON.stringify(body);
   res.writeHead(status, { "Content-Type": "application/json" });
   res.end(payload);
@@ -53,18 +62,41 @@ export class EditorServer {
   private readonly wss = new WebSocketServer({ noServer: true });
   private clients = new Set<WebSocket>();
   private port = 0;
+  /**
+   * Per-run session token. Written to server.json (readable by local processes,
+   * NOT by webpages) and required on every request: header `x-aive-token` for
+   * HTTP, `?token=` for the WS upgrade and /file (media elements can't set
+   * headers). Rotates on every core start.
+   */
+  private token = randomBytes(24).toString("base64url");
 
   constructor(
     readonly engine: EditorEngine,
     readonly options: { port?: number; dataDir: string } = { dataDir: process.cwd() },
   ) {
     this.http.on("upgrade", (req, socket, head) => {
+      // WS upgrade auth: browsers can't set headers on WebSocket() so the token
+      // rides the query string. Reject bad/missing tokens before the upgrade.
+      const url = new URL(req.url ?? "/", `http://127.0.0.1:${this.port}`);
+      if (!this.isAuthorized(req, url)) {
+        socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
+        socket.destroy();
+        return;
+      }
       this.wss.handleUpgrade(req, socket, head, (ws) => this.onConnection(ws));
     });
 
-    // Broadcast engine changes + render progress to all UI clients.
-    this.engine.on("change", (project) => this.broadcast({ type: "state", project, filePath: this.engine.getCurrentPath() ?? null }));
+    // Broadcast engine changes + render progress + job updates to all UI clients.
+    this.engine.on("change", (project) =>
+      this.broadcast({
+        type: "state",
+        project,
+        filePath: this.engine.getCurrentPath() ?? null,
+        recovery: this.engine.recoveryInfo(),
+      }),
+    );
     this.engine.on("progress", (info) => this.broadcast({ type: "progress", ...info }));
+    this.engine.on("job", (job) => this.broadcast({ type: "job", job }));
   }
 
   async start(): Promise<number> {
@@ -78,7 +110,7 @@ export class EditorServer {
     await mkdir(this.options.dataDir, { recursive: true });
     await writeFile(
       join(this.options.dataDir, "server.json"),
-      JSON.stringify({ port: this.port, pid: process.pid, startedAt: Date.now() }, null, 2),
+      JSON.stringify({ port: this.port, pid: process.pid, startedAt: Date.now(), token: this.token }, null, 2),
       "utf8",
     );
     return this.port;
@@ -86,6 +118,17 @@ export class EditorServer {
 
   getPort(): number {
     return this.port;
+  }
+
+  /** The session token local clients must present (also published in server.json). */
+  getToken(): string {
+    return this.token;
+  }
+
+  /** Constant-time-ish token check: header for HTTP, ?token= for WS//file. */
+  private isAuthorized(req: IncomingMessage, url: URL): boolean {
+    const presented = (req.headers["x-aive-token"] as string | undefined) ?? url.searchParams.get("token") ?? "";
+    return presented.length > 0 && presented === this.token;
   }
 
   async stop(): Promise<void> {
@@ -97,7 +140,14 @@ export class EditorServer {
   // ---- WebSocket -------------------------------------------------------------
   private onConnection(ws: WebSocket): void {
     this.clients.add(ws);
-    ws.send(JSON.stringify({ type: "state", project: this.engine.getProject(), filePath: this.engine.getCurrentPath() ?? null }));
+    ws.send(
+      JSON.stringify({
+        type: "state",
+        project: this.engine.getProject(),
+        filePath: this.engine.getCurrentPath() ?? null,
+        recovery: this.engine.recoveryInfo(),
+      }),
+    );
 
     ws.on("message", async (data) => {
       let msg: { type?: string; id?: string; method?: string; params?: unknown };
@@ -138,8 +188,13 @@ export class EditorServer {
   // ---- HTTP ------------------------------------------------------------------
   private async handleHttp(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const url = new URL(req.url ?? "/", `http://127.0.0.1:${this.port}`);
+    const authed = this.isAuthorized(req, url);
+    // CORS-readable responses only for token holders (see cors() above).
+    const respond = (status: number, body: unknown) => sendJson(res, status, body, authed);
 
     if (req.method === "OPTIONS") {
+      // Preflight carries no data; answer it so token-holding pages can follow
+      // up with the real (authenticated) request.
       cors(res);
       res.writeHead(204);
       res.end();
@@ -148,19 +203,38 @@ export class EditorServer {
 
     try {
       if (req.method === "GET" && url.pathname === "/health") {
+        // Tokenless liveness ping for local discovery — but internals (ffmpeg
+        // banner, project revision) only for authenticated callers.
+        if (!authed) {
+          sendJson(res, 200, { ok: true, port: this.port }, false);
+          return;
+        }
         const bins = await checkBinaries().catch((e) => ({ error: String(e) }));
-        sendJson(res, 200, { ok: true, port: this.port, ffmpeg: bins, revision: this.engine.getProject().revision });
+        respond(200, { ok: true, port: this.port, ffmpeg: bins, revision: this.engine.getProject().revision });
+        return;
+      }
+
+      if (!authed) {
+        respond(401, {
+          ok: false,
+          error:
+            "Unauthorized: missing or invalid session token. Read `token` from <dataDir>/server.json and send it as the `x-aive-token` header (HTTP) or `?token=` query param (WebSocket / /file).",
+        });
         return;
       }
 
       if (req.method === "GET" && url.pathname === "/state") {
-        sendJson(res, 200, { ok: true, result: this.engine.getProject() satisfies Project });
+        respond(200, {
+          ok: true,
+          result: this.engine.getProject() satisfies Project,
+          recovery: this.engine.recoveryInfo(),
+        });
         return;
       }
 
       if (req.method === "GET" && url.pathname === "/methods") {
         const list = Object.entries(methods).map(([name, m]) => ({ name, description: m.description }));
-        sendJson(res, 200, { ok: true, methods: list });
+        respond(200, { ok: true, methods: list });
         return;
       }
 
@@ -170,19 +244,19 @@ export class EditorServer {
         try {
           parsed = JSON.parse(body || "{}");
         } catch {
-          sendJson(res, 400, { ok: false, error: "Invalid JSON body" });
+          respond(400, { ok: false, error: "Invalid JSON body" });
           return;
         }
         if (!parsed.method) {
-          sendJson(res, 400, { ok: false, error: "Missing 'method'" });
+          respond(400, { ok: false, error: "Missing 'method'" });
           return;
         }
         try {
           const result = await dispatch(this.engine, parsed.method, parsed.params);
-          sendJson(res, 200, { ok: true, result });
+          respond(200, { ok: true, result });
         } catch (err) {
           const status = err instanceof RpcError && err.code !== "handler_error" ? 400 : 500;
-          sendJson(res, status, { ok: false, error: err instanceof Error ? err.message : String(err) });
+          respond(status, { ok: false, error: err instanceof Error ? err.message : String(err) });
         }
         return;
       }
@@ -192,9 +266,9 @@ export class EditorServer {
         return;
       }
 
-      sendJson(res, 404, { ok: false, error: "Not found" });
+      respond(404, { ok: false, error: "Not found" });
     } catch (err) {
-      sendJson(res, 500, { ok: false, error: err instanceof Error ? err.message : String(err) });
+      respond(500, { ok: false, error: err instanceof Error ? err.message : String(err) });
     }
   }
 
@@ -202,6 +276,14 @@ export class EditorServer {
   private async serveFile(path: string | null, req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (!path) {
       sendJson(res, 400, { ok: false, error: "Missing 'path'" });
+      return;
+    }
+    if (!this.engine.isServablePath(path)) {
+      sendJson(res, 403, {
+        ok: false,
+        error:
+          "Forbidden: /file only serves files under the editor data dir or files belonging to imported assets. Import the media first (import_video), then stream the asset's own path.",
+      });
       return;
     }
     let info;

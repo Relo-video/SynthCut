@@ -80,6 +80,25 @@ from `scratch/`.
 npx tsx apps/desktop/scripts/smoke-composite.ts                        # compositor plan: z-order, transitions, fades, keyframes, mute/hide
 npx tsx packages/core/scripts/smoke-clip-tokenizer.ts                  # CLIP text tokenizer (semantic-search input)
 
+# Security: session-token auth (HTTP/WS) + /file allowlist (self-synthesizes media)
+npx tsx packages/core/scripts/smoke-security.ts
+
+# Jobs: background export with progress, cancel_job (partial file deleted), crash-recovery surfacing
+npx tsx packages/core/scripts/smoke-jobs.ts
+
+# Segment render cache: incremental previews (tail edit re-renders only the tail),
+# single-segment get_frame, single-pass fallback (self-synthesizes media)
+npx tsx packages/core/scripts/smoke-cache.ts
+
+# Loudness normalization on export (ebur128 verification), adjustment layers,
+# and the pro-polish set (SRT/VTT round-trip, named markers, drawtext word wrap)
+npx tsx packages/core/scripts/smoke-loudnorm.ts
+npx tsx packages/core/scripts/smoke-adjustment.ts
+npx tsx packages/core/scripts/smoke-polish.ts
+
+# OpenTimelineIO interop: lossless export→import round-trip + foreign OTIO import
+npx tsx packages/core/scripts/smoke-otio.ts
+
 # Core editing + render, multi-track compositing, and the full MCP path
 npx tsx packages/core/scripts/smoke.ts             scratch/a.mp4 scratch/b.mp4
 npx tsx packages/mcp/scripts/smoke.ts              scratch/a.mp4 scratch/b.mp4
@@ -103,6 +122,10 @@ npx tsx packages/core/scripts/smoke-music.ts       scratch/a.mp4 scratch/b.mp4 s
 npx tsx packages/core/scripts/smoke-captions.ts    scratch/jfk.wav
 npx tsx packages/core/scripts/smoke-reframe.ts
 npx tsx packages/core/scripts/smoke-jlcut.ts
+
+# Text-based editing: word-level transcripts, delete_transcript_ranges,
+# tighten_talk, edit_by_transcript (self-contained — uses the checked-in fixture)
+npx tsx packages/core/scripts/smoke-textedit.ts
 
 # Media intelligence: transcript index/search, visual + CLIP semantic search, audio sync
 npx tsx packages/core/scripts/smoke-media.ts       scratch/a.mp4 scratch/b.mp4

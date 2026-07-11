@@ -45,12 +45,12 @@ function even(n: number): number {
  * still override individual fields.
  */
 export const EXPORT_PRESETS: Record<string, ExportSettings> = {
-  youtube: { container: "mp4", videoCodec: "h264", quality: 18, audioBitrate: "192k" },
-  youtube_hevc: { container: "mp4", videoCodec: "h265", quality: 22, audioBitrate: "192k" },
-  social: { container: "mp4", videoCodec: "h264", quality: 20, audioBitrate: "128k" }, // Reels/Shorts/TikTok
-  square: { container: "mp4", videoCodec: "h264", quality: 20, audioBitrate: "160k" },
-  web: { container: "webm", videoCodec: "vp9", quality: 32, audioCodec: "opus", audioBitrate: "128k" },
-  master: { container: "mov", videoCodec: "h264", quality: 14, preset: "slow", audioBitrate: "256k" },
+  youtube: { container: "mp4", videoCodec: "h264", quality: 18, audioBitrate: "192k", loudnessTarget: -14 },
+  youtube_hevc: { container: "mp4", videoCodec: "h265", quality: 22, audioBitrate: "192k", loudnessTarget: -14 },
+  social: { container: "mp4", videoCodec: "h264", quality: 20, audioBitrate: "128k", loudnessTarget: -14 }, // Reels/Shorts/TikTok
+  square: { container: "mp4", videoCodec: "h264", quality: 20, audioBitrate: "160k", loudnessTarget: -14 },
+  web: { container: "webm", videoCodec: "vp9", quality: 32, audioCodec: "opus", audioBitrate: "128k", loudnessTarget: -16 },
+  master: { container: "mov", videoCodec: "h264", quality: 14, preset: "slow", audioBitrate: "256k" }, // no loudnorm — untouched master audio
 };
 export const EXPORT_PRESET_NAMES = Object.keys(EXPORT_PRESETS) as (keyof typeof EXPORT_PRESETS)[];
 
@@ -106,12 +106,20 @@ function atempoFactors(speed: number): number[] {
 // ---- per-clip transform + keyframe animation (baked into the filtergraph) ----
 //
 // A clip's keyframe tracks (resolved to clip-local seconds) and/or static
-// transform are compiled into FFmpeg time-expressions of `T`. The geometric
-// transform is baked with a single `geq` that, for each output pixel, inverts
-// the affine (translate→rotate→scale→flip about the canvas centre) and samples
-// the fitted layer — the SAME math the desktop Canvas2D compositor uses, so
-// preview and export agree. geq is only emitted when a clip actually has a
-// non-identity transform / opacity / animation (normal clips keep the fast path).
+// transform are compiled into FFmpeg time-expressions. Two bake strategies,
+// SAME math as the desktop Canvas2D compositor (flip → scale → rotate →
+// translate about the canvas centre), so preview and export agree:
+//
+//  FAST AFFINE PATH (the default, covers ~all real cases): hflip/vflip +
+//  `scale` (static factor) + `rotate` (angle may be a t-expression; transparent
+//  fill, hypot-sized so nothing clips) on the fitted layer, then an `overlay`
+//  onto a transparent canvas whose x/y expressions carry the (possibly
+//  animated) translate. Runs at real filter speed.
+//
+//  geq FALLBACK (slow, per-pixel): only for what the fast path can't express —
+//  ANIMATED scale or ANIMATED opacity (FFmpeg's scale/colorchannelmixer can't
+//  re-evaluate per frame safely). Forced with AIVE_TRANSFORM_GEQ=1 (used by
+//  smoke-transform to A/B the two paths). A stderr note marks each fallback.
 
 const num = (n: number): string => (Number.isFinite(n) ? n.toFixed(6) : "0");
 
@@ -165,6 +173,66 @@ function transformActive(e: ResolvedEffects | undefined): boolean {
   }
   if (e.opacity !== undefined && e.opacity !== 1) return true;
   return hasTransformKf(e.keyframes);
+}
+
+/** How a clip's transform will be baked. */
+type TransformPlan =
+  | { kind: "none" }
+  | {
+      kind: "fast";
+      /** Filter steps applied to the fitted layer (flips, opacity, scale, rotate). */
+      layerSteps: string[];
+      /** overlay x/y expressions (single-quoted by the caller; may reference t). */
+      xExpr: string;
+      yExpr: string;
+    }
+  | { kind: "geq" };
+
+/**
+ * Decide the bake strategy for a clip's transform. The fast affine path covers
+ * everything except ANIMATED scale/opacity (no per-frame re-eval in scale/
+ * colorchannelmixer) — those fall back to the per-pixel geq.
+ */
+function planTransform(e: ResolvedEffects | undefined, W: number, H: number): TransformPlan {
+  if (!transformActive(e)) return { kind: "none" };
+  const k = e!.keyframes ?? {};
+  if (process.env.AIVE_TRANSFORM_GEQ === "1" || k.scale?.length || k.opacity?.length) {
+    return { kind: "geq" };
+  }
+
+  const t = e!.transform ?? {};
+  const layerSteps: string[] = [];
+  if (t.flipH) layerSteps.push("hflip");
+  if (t.flipV) layerSteps.push("vflip");
+
+  const opacity = e!.opacity ?? 1;
+  if (opacity !== 1) layerSteps.push(`colorchannelmixer=aa=${num(clampN(opacity, 0, 1))}`);
+
+  const scale = t.scale ?? 1;
+  if (scale !== 1) {
+    const s = num(Math.max(0.0001, scale));
+    layerSteps.push(`scale=w='max(2,round(iw*${s}))':h='max(2,round(ih*${s}))':flags=lanczos+accurate_rnd+full_chroma_int`);
+  }
+
+  const rotKf = k.rotation;
+  const rotation = t.rotation ?? 0;
+  if (rotKf?.length || rotation !== 0) {
+    // Angle may be a t-expression; hypot-sized transparent output so no clipping
+    // at any angle (and a constant frame size when the angle animates).
+    const angle = kfExpr(rotKf, rotation, "t");
+    layerSteps.push(`rotate=a='(${angle})*PI/180':ow='hypot(iw,ih)':oh='hypot(iw,ih)':c=none`);
+  }
+
+  // Translate rides the positioning overlay: centre the (scaled/rotated) layer,
+  // then offset by the canvas-fraction x/y (which may be keyframe expressions).
+  const exX = kfExpr(k.x, t.x ?? 0, "t");
+  const exY = kfExpr(k.y, t.y ?? 0, "t");
+  return {
+    kind: "fast",
+    layerSteps,
+    xExpr: `(W-w)/2+(${exX})*${W}`,
+    yExpr: `(H-h)/2+(${exY})*${H}`,
+  };
 }
 
 /**
@@ -323,12 +391,23 @@ function effectSteps(filters: VisualEffect[], W: number, H: number): string[] {
 }
 
 /**
- * Build the per-clip video filter chain. The result is an **RGBA** stream
- * scaled to fit the canvas with TRANSPARENT letter/pillar-box padding, so when
- * it is overlaid on a lower track the background shows through the bars (true
- * layering). Fades ramp the alpha for the same reason.
+ * Emit the per-clip video filter graph parts into `filterParts`, ending in
+ * `[outLabel]`. The result is an **RGBA** stream scaled to fit the canvas with
+ * TRANSPARENT letter/pillar-box padding, so when it is overlaid on a lower
+ * track the background shows through the bars (true layering). Fades ramp the
+ * alpha for the same reason. A clip with a fast-path transform becomes a small
+ * sub-graph (layer steps + positioning overlay onto a transparent canvas);
+ * everything else stays one linear chain.
  */
-function videoFilterChain(clip: ResolvedRenderClip, W: number, H: number, fps: number): string {
+function emitClipVideoParts(
+  filterParts: string[],
+  clip: ResolvedRenderClip,
+  inputIdx: number,
+  W: number,
+  H: number,
+  fps: number,
+  outLabel: string,
+): void {
   const fx = clip.effects ?? {};
   const speed = fx.speed ?? 1;
   const outDur = clip.outDuration;
@@ -377,14 +456,33 @@ function videoFilterChain(clip: ResolvedRenderClip, W: number, H: number, fps: n
 
   // Per-clip 2D transform + keyframe animation (position/scale/rotation/flip/
   // opacity), baked before text so overlays stay in canvas space (as in preview).
-  const tStep = transformStep(fx, W, H);
-  if (tStep) steps.push(tStep);
+  const textSteps = (clip.overlays ?? []).map((ov) => drawTextStep(ov));
+  const plan = planTransform(fx, W, H);
 
-  for (const ov of clip.overlays ?? []) {
-    steps.push(drawTextStep(ov));
+  if (plan.kind === "fast") {
+    // Layer steps on the fitted stream, then position it on a transparent
+    // canvas via overlay (x/y may be animated t-expressions → single-quoted).
+    steps.push(...plan.layerSteps);
+    const fit = `tfit${inputIdx}`;
+    const base = `tbase${inputIdx}`;
+    filterParts.push(`[${inputIdx}:v]${steps.join(",")}[${fit}]`);
+    filterParts.push(`color=c=black@0.0:s=${W}x${H}:r=${fps}:d=${outDur.toFixed(6)},format=rgba[${base}]`);
+    const tail = ["format=rgba", ...textSteps].join(",");
+    filterParts.push(
+      `[${base}][${fit}]overlay=x='${plan.xExpr}':y='${plan.yExpr}':shortest=1:format=auto:eof_action=pass,${tail}[${outLabel}]`,
+    );
+    return;
   }
 
-  return steps.join(",");
+  if (plan.kind === "geq") {
+    console.error(
+      "[aive-render] note: transform on this clip uses the slow per-pixel path (animated scale/opacity aren't expressible as fast filters)",
+    );
+    const g = transformStep(fx, W, H);
+    if (g) steps.push(g);
+  }
+  steps.push(...textSteps);
+  filterParts.push(`[${inputIdx}:v]${steps.join(",")}[${outLabel}]`);
 }
 
 /** Position expressions for an overlay, in terms of the canvas w/h and text size. */
@@ -538,6 +636,7 @@ export function exportCodecArgs(
   settings: ExportSettings | undefined,
   profile: RenderProfile,
   outputPath: string,
+  hwEncoder?: string | null,
 ): string[] {
   const ext = (outputPath.split(".").pop() ?? "").toLowerCase();
   const container = settings?.container ?? (ext === "webm" ? "webm" : ext === "mov" ? "mov" : "mp4");
@@ -545,20 +644,50 @@ export function exportCodecArgs(
   const vcodec = settings?.videoCodec ?? (isWebm ? "vp9" : "h264");
   const acodec = settings?.audioCodec ?? (isWebm ? "opus" : "aac");
 
-  const vlib = vcodec === "h265" ? "libx265" : vcodec === "vp9" ? "libvpx-vp9" : "libx264";
   const alib = acodec === "opus" ? "libopus" : "aac";
   // CRF scales differ per codec; pick a sensible default if none given.
   const defaultCrf = vcodec === "vp9" ? 32 : vcodec === "h265" ? 24 : profile.crf;
   const crf = settings?.quality ?? defaultCrf;
 
-  const args: string[] = ["-c:v", vlib];
-  if (vcodec !== "vp9") args.push("-preset", settings?.preset ?? profile.preset);
-  if (settings?.videoBitrate) args.push("-b:v", settings.videoBitrate);
-  else args.push("-crf", String(crf), ...(vcodec === "vp9" ? ["-b:v", "0"] : []));
+  const args: string[] = [];
+  if (hwEncoder && vcodec !== "vp9") {
+    // Hardware encoder with a codec-appropriate constant-quality mapping.
+    args.push("-c:v", hwEncoder);
+    if (settings?.videoBitrate) args.push("-b:v", settings.videoBitrate);
+    else if (hwEncoder.endsWith("_nvenc")) args.push("-preset", "p4", "-rc", "vbr", "-cq", String(crf), "-b:v", "0");
+    else if (hwEncoder.endsWith("_qsv")) args.push("-global_quality", String(crf));
+    else if (hwEncoder.endsWith("_amf")) args.push("-rc", "cqp", "-qp_i", String(crf), "-qp_p", String(crf));
+    else if (hwEncoder.endsWith("_videotoolbox")) args.push("-q:v", "55");
+  } else {
+    const vlib = vcodec === "h265" ? "libx265" : vcodec === "vp9" ? "libvpx-vp9" : "libx264";
+    args.push("-c:v", vlib);
+    if (vcodec !== "vp9") args.push("-preset", settings?.preset ?? profile.preset);
+    if (settings?.videoBitrate) args.push("-b:v", settings.videoBitrate);
+    else args.push("-crf", String(crf), ...(vcodec === "vp9" ? ["-b:v", "0"] : []));
+  }
   args.push("-pix_fmt", "yuv420p", "-c:a", alib, "-b:a", settings?.audioBitrate ?? profile.audioBitrate);
   // faststart only helps the mp4/mov atom layout; webm doesn't use it.
   if (!isWebm) args.push("-movflags", "+faststart");
   return args;
+}
+
+/** Extra render-command behaviors (segment cache + hardware encoding). */
+export interface RenderOptions {
+  /** Hardware encoder name (from pickHwEncoder) to use instead of libx264/x265. */
+  hwEncoder?: string | null;
+  /**
+   * Render only this absolute timeline window [start, end) seconds: clips whose
+   * runs miss the window are dropped (their inputs too); runs crossing the left
+   * edge are head-trimmed AFTER their per-clip chains, so clip-local features
+   * (fades, keyframes, text windows) stay correct.
+   */
+  window?: { start: number; end: number };
+  /** Video-only render (no audio graph at all) — segment cache entries. */
+  videoOnly?: boolean;
+  /** Audio-only render (no video graph) — the preview's single audio pass. */
+  audioOnly?: boolean;
+  /** Wrap the output in MPEG-TS (losslessly concat-able segments). */
+  mpegts?: boolean;
 }
 
 export function buildRenderCommand(
@@ -568,8 +697,13 @@ export function buildRenderCommand(
   profile: RenderProfile,
   music?: ResolvedMusic,
   settings?: ExportSettings,
+  opts: RenderOptions = {},
 ): RenderCommand {
-  if (clips.length === 0) {
+  const window = opts.window;
+  if (window && !opts.videoOnly) {
+    throw new Error("Windowed rendering is video-only (segments carry no audio; the preview runs one full audio pass).");
+  }
+  if (clips.length === 0 && !window && !opts.audioOnly) {
     throw new Error("Cannot render an empty timeline — add at least one clip.");
   }
 
@@ -578,45 +712,98 @@ export function buildRenderCommand(
   const fps = canvas.fps;
 
   // Total timeline length: the furthest video OR audio extent.
-  let total = 0;
+  let fullTotal = 0;
   for (const c of clips) {
-    total = Math.max(total, c.startSec + c.outDuration);
+    fullTotal = Math.max(fullTotal, c.startSec + c.outDuration);
     const aShift = c.audioOffset && c.audioOffset > 0 ? c.audioOffset : 0;
-    if (c.hasAudio) total = Math.max(total, c.startSec + aShift + c.outDuration);
+    if (c.hasAudio) fullTotal = Math.max(fullTotal, c.startSec + aShift + c.outDuration);
   }
-  total = Math.max(total, 1 / fps);
+  fullTotal = Math.max(fullTotal, 1 / fps);
+  const total = window ? Math.max(1 / fps, window.end - window.start) : fullTotal;
+  /** Shift an absolute timeline second into output time. */
+  const rel = (sec: number) => sec - (window?.start ?? 0);
+
+  // ---- group clips into per-track transition runs (FIRST, so a window can
+  // drop whole runs — and their file inputs — when they miss it) --------------
+  const byTrack = new Map<number, { clip: ResolvedRenderClip; idx: number }[]>();
+  clips.forEach((clip, idx) => {
+    if (clip.adjustment) return; // no source/run — applied to the stack below
+    const list = byTrack.get(clip.trackIndex) ?? [];
+    list.push({ clip, idx });
+    byTrack.set(clip.trackIndex, list);
+  });
+  const runIntersects = (run: Run): boolean => {
+    if (!window) return true;
+    const runEnd = Math.max(...run.clips.map((c) => c.startSec + c.outDuration));
+    return run.startSec < window.end && runEnd > window.start;
+  };
+  const videoRuns: Run[] = [];
+  const audioRuns: Run[] = [];
+  for (const [, list] of byTrack) {
+    list.sort((a, b) => a.clip.startSec - b.clip.startSec);
+    // Video runs are built from only the video-visible clips: an audio-only
+    // clip (wav/mp3 on a video track) has no [N:v] stream, so it must neither
+    // join a video run nor sit inside one as a dangling label.
+    if (!opts.audioOnly) {
+      for (const run of groupRuns(list.filter((e) => e.clip.showVideo))) {
+        if (runIntersects(run)) videoRuns.push(run);
+      }
+    }
+    for (const run of groupRuns(list)) {
+      if (!runIntersects(run)) continue;
+      if (!opts.videoOnly && run.clips.some((c) => c.hasAudio && !c.muted)) audioRuns.push(run);
+    }
+  }
+
+  // Which clip array indices actually render (drives the input list).
+  const usedIdx = new Set<number>();
+  for (const run of videoRuns) run.idxs.forEach((i) => usedIdx.add(i));
+  for (const run of audioRuns) run.idxs.forEach((i) => usedIdx.add(i));
 
   const inputArgs: string[] = [];
-  // File inputs (one per clip), trimmed at the input level for fast seeking.
+  // File inputs (one per used clip), trimmed at the input level for fast seeking.
   // A still image has no timeline to seek — loop the single frame at the canvas
   // fps for the clip's duration so it behaves like any other footage.
-  clips.forEach((clip) => {
+  const inputIdxByClip = new Map<number, number>();
+  let nextIndex = 0;
+  clips.forEach((clip, i) => {
+    if (!usedIdx.has(i)) return;
     if (clip.isImage) {
       inputArgs.push("-loop", "1", "-framerate", String(fps), "-t", clip.outDuration.toFixed(6), "-i", clip.path);
     } else {
       inputArgs.push("-ss", clip.sourceIn.toFixed(6), "-t", clip.sourceSpan.toFixed(6), "-i", clip.path);
     }
+    inputIdxByClip.set(i, nextIndex++);
   });
-  let nextIndex = clips.length;
 
   // Motion-graphic overlay inputs: one alpha video per graphic, composited over
   // its owning clip within a window (absolute paths fine — referenced by index).
   const graphicInputs: { clipIdx: number; inputIdx: number; g: ResolvedGraphic }[] = [];
-  clips.forEach((clip, i) => {
-    for (const g of clip.graphics ?? []) {
-      inputArgs.push("-i", g.path);
-      graphicInputs.push({ clipIdx: i, inputIdx: nextIndex++, g });
-    }
-  });
+  if (!opts.audioOnly) {
+    clips.forEach((clip, i) => {
+      if (!usedIdx.has(i)) return;
+      for (const g of clip.graphics ?? []) {
+        inputArgs.push("-i", g.path);
+        graphicInputs.push({ clipIdx: i, inputIdx: nextIndex++, g });
+      }
+    });
+  }
 
   const filterParts: string[] = [];
 
   // ---- per-clip base streams ------------------------------------------------
+  const videoIdx = new Set<number>();
+  for (const run of videoRuns) run.idxs.forEach((i) => videoIdx.add(i));
+  const audioIdx = new Set<number>();
+  for (const run of audioRuns) run.idxs.forEach((i) => audioIdx.add(i));
+
   clips.forEach((clip, i) => {
-    if (clip.showVideo) {
+    const inputIdx = inputIdxByClip.get(i);
+    if (inputIdx === undefined) return;
+    if (clip.showVideo && videoIdx.has(i)) {
       const graphicsForClip = graphicInputs.filter((x) => x.clipIdx === i);
       const baseLabel = graphicsForClip.length ? `vbase${i}` : `v${i}`;
-      filterParts.push(`[${i}:v]${videoFilterChain(clip, W, H, fps)}[${baseLabel}]`);
+      emitClipVideoParts(filterParts, clip, inputIdx, W, H, fps, baseLabel);
 
       if (graphicsForClip.length) {
         let cur = `[${baseLabel}]`;
@@ -640,28 +827,10 @@ export function buildRenderCommand(
         });
       }
     }
-    if (clip.hasAudio && !clip.muted) {
-      filterParts.push(`[${i}:a]${audioFilterChain(clip)}[a${i}]`);
+    if (clip.hasAudio && !clip.muted && audioIdx.has(i)) {
+      filterParts.push(`[${inputIdx}:a]${audioFilterChain(clip)}[a${i}]`);
     }
   });
-
-  // ---- group clips into per-track transition runs ---------------------------
-  const byTrack = new Map<number, { clip: ResolvedRenderClip; idx: number }[]>();
-  clips.forEach((clip, idx) => {
-    const list = byTrack.get(clip.trackIndex) ?? [];
-    list.push({ clip, idx });
-    byTrack.set(clip.trackIndex, list);
-  });
-  const videoRuns: Run[] = [];
-  const audioRuns: Run[] = [];
-  for (const [, list] of byTrack) {
-    list.sort((a, b) => a.clip.startSec - b.clip.startSec);
-    const runs = groupRuns(list);
-    for (const run of runs) {
-      if (run.clips.some((c) => c.showVideo)) videoRuns.push(run);
-      if (run.clips.some((c) => c.hasAudio && !c.muted)) audioRuns.push(run);
-    }
-  }
 
   // ---- video: assemble each run, then overlay onto a black base in z-order ---
   const videoSegments: { label: string; startSec: number; dur: number; trackIndex: number }[] = [];
@@ -683,103 +852,214 @@ export function buildRenderCommand(
       cur = `[${out}]`;
       curDur = curDur + clip.outDuration - d;
     }
-    videoSegments.push({ label: cur, startSec: run.startSec, dur: curDur, trackIndex: run.trackIndex });
+    // A run crossing the window's left edge is head-trimmed AFTER its per-clip
+    // chains — every clip-local feature (fades, keyframes, drawtext windows)
+    // was already applied on the un-shifted local clock, so this stays exact.
+    let startSec = rel(run.startSec);
+    if (window && startSec < -1e-6) {
+      const cut = -startSec;
+      const trimmed = `vwin${r}`;
+      filterParts.push(`${cur}trim=start=${cut.toFixed(6)},setpts=PTS-STARTPTS[${trimmed}]`);
+      cur = `[${trimmed}]`;
+      curDur = Math.max(0, curDur - cut);
+      startSec = 0;
+    }
+    if (curDur > 1e-6) {
+      videoSegments.push({ label: cur, startSec, dur: curDur, trackIndex: run.trackIndex });
+    }
   });
 
   // Bottom→top: lower Track.index first so higher tracks overlay on top.
   videoSegments.sort((a, b) => a.trackIndex - b.trackIndex || a.startSec - b.startSec);
 
-  filterParts.push(`color=c=black:s=${W}x${H}:r=${fps}:d=${total.toFixed(6)},format=rgba[vbase]`);
-  let vcur = "[vbase]";
-  videoSegments.forEach((seg, i) => {
-    const start = seg.startSec;
-    const end = start + seg.dur;
-    let s = seg.label;
-    if (start > 1e-3) {
-      const padded = `vpad${i}`;
-      filterParts.push(`${s}tpad=start_duration=${start.toFixed(3)}:color=0x00000000,setpts=PTS-STARTPTS[${padded}]`);
-      s = `[${padded}]`;
+  if (!opts.audioOnly) {
+    // ADJUSTMENT layers: source-less clips whose grade/effects apply to the
+    // stacked composite of everything BELOW their track, inside their window.
+    // Uniform bake (no per-filter timeline-support matrix): split the stack,
+    // trim the window, run the filters, re-overlay gated by enable.
+    interface AdjustOp {
+      trackIndex: number;
+      start: number;
+      end: number;
+      steps: string[];
     }
-    const out = `vstack${i}`;
-    const enable = `enable='between(t,${start.toFixed(3)},${end.toFixed(3)})'`;
-    filterParts.push(`${vcur}${s}overlay=0:0:eof_action=pass:${enable}[${out}]`);
-    vcur = `[${out}]`;
-  });
-  filterParts.push(`${vcur}trim=0:${total.toFixed(6)},format=yuv420p[outv]`);
+    const adjustOps: AdjustOp[] = [];
+    for (const c of clips) {
+      if (!c.adjustment || !c.showVideo) continue;
+      const start = Math.max(0, rel(c.startSec));
+      const end = Math.min(total, rel(c.startSec) + c.outDuration);
+      if (end - start < 1e-3) continue;
+      const fx = c.effects ?? {};
+      const steps: string[] = [];
+      if (fx.color) {
+        const cc = fx.color;
+        steps.push(
+          `eq=brightness=${cc.brightness ?? 0}:contrast=${cc.contrast ?? 1}:saturation=${cc.saturation ?? 1}:gamma=${cc.gamma ?? 1}`,
+        );
+      }
+      if (fx.grade) steps.push(...colorGradeSteps(fx.grade));
+      if (fx.lut) steps.push(`lut3d=${fx.lut}`);
+      if (fx.filters?.length) steps.push(...effectSteps(fx.filters, W, H));
+      if (steps.length === 0) continue; // an adjustment with no look yet is a no-op
+      adjustOps.push({ trackIndex: c.trackIndex, start, end, steps });
+    }
+
+    // Interleave segments + adjustment ops by track level (adjust AFTER its
+    // own track's segments so it grades everything below and beside it).
+    type StackOp = { order: [number, number, number] } & (
+      | { kind: "seg"; seg: (typeof videoSegments)[number]; idx: number }
+      | { kind: "adjust"; op: AdjustOp }
+    );
+    const ops: StackOp[] = [
+      ...videoSegments.map((seg, idx): StackOp => ({ kind: "seg", seg, idx, order: [seg.trackIndex, 0, seg.startSec] })),
+      ...adjustOps.map((op): StackOp => ({ kind: "adjust", op, order: [op.trackIndex, 1, op.start] })),
+    ];
+    ops.sort((a, b) => a.order[0] - b.order[0] || a.order[1] - b.order[1] || a.order[2] - b.order[2]);
+
+    filterParts.push(`color=c=black:s=${W}x${H}:r=${fps}:d=${total.toFixed(6)},format=rgba[vbase]`);
+    let vcur = "[vbase]";
+    let adjIdx = 0;
+    ops.forEach((item, i) => {
+      if (item.kind === "seg") {
+        const seg = item.seg;
+        const start = seg.startSec;
+        const end = start + seg.dur;
+        let s = seg.label;
+        if (start > 1e-3) {
+          const padded = `vpad${i}`;
+          filterParts.push(`${s}tpad=start_duration=${start.toFixed(3)}:color=0x00000000,setpts=PTS-STARTPTS[${padded}]`);
+          s = `[${padded}]`;
+        }
+        const out = `vstack${i}`;
+        const enable = `enable='between(t,${start.toFixed(3)},${end.toFixed(3)})'`;
+        filterParts.push(`${vcur}${s}overlay=0:0:eof_action=pass:${enable}[${out}]`);
+        vcur = `[${out}]`;
+        return;
+      }
+      const { start, end, steps } = item.op;
+      const k = adjIdx++;
+      const S = start.toFixed(3);
+      const E = end.toFixed(3);
+      // Filter a full-length copy of the stack, then let the overlay's enable
+      // pick the filtered picture only inside the window. (Trimming/re-padding
+      // the branch instead desyncs the overlay's frame pairing — the branches
+      // must stay timestamp-aligned for enable to switch cleanly.)
+      filterParts.push(`${vcur}split=2[adjb${k}][adjs${k}]`);
+      filterParts.push(`[adjs${k}]${steps.join(",")}[adjf${k}]`);
+      filterParts.push(`[adjb${k}][adjf${k}]overlay=0:0:eof_action=pass:enable='between(t,${S},${E})'[adjo${k}]`);
+      vcur = `[adjo${k}]`;
+    });
+    filterParts.push(`${vcur}trim=0:${total.toFixed(6)},format=yuv420p[outv]`);
+  }
 
   // ---- audio: assemble each run, delay to its start, mix --------------------
-  const audioLabels: string[] = [];
-  // Silent base guarantees a valid mix even if nothing has audio.
-  inputArgs.push("-f", "lavfi", "-t", total.toFixed(6), "-i", "anullsrc=channel_layout=stereo:sample_rate=48000");
-  const silenceIdx = nextIndex++;
-  filterParts.push(`[${silenceIdx}:a]asetpts=PTS-STARTPTS[abase]`);
-  audioLabels.push("[abase]");
+  let audioOut = "";
+  if (!opts.videoOnly) {
+    const audioLabels: string[] = [];
+    // Silent base guarantees a valid mix even if nothing has audio.
+    inputArgs.push("-f", "lavfi", "-t", total.toFixed(6), "-i", "anullsrc=channel_layout=stereo:sample_rate=48000");
+    const silenceIdx = nextIndex++;
+    filterParts.push(`[${silenceIdx}:a]asetpts=PTS-STARTPTS[abase]`);
+    audioLabels.push("[abase]");
 
-  audioRuns.forEach((run, r) => {
-    const members = run.clips
-      .map((clip, i) => ({ clip, idx: run.idxs[i] }))
-      .filter((m) => m.clip.hasAudio && !m.clip.muted);
-    if (members.length === 0) return;
-    let cur = `[a${members[0].idx}]`;
-    for (let i = 1; i < members.length; i++) {
-      const d = clampOverlap(members[i].clip.transition?.duration ?? 0, members[i - 1].clip.outDuration, members[i].clip.outDuration, fps);
-      const out = `arun${r}_${i}`;
-      if (d > 0) {
-        filterParts.push(`${cur}[a${members[i].idx}]acrossfade=d=${d.toFixed(3)}[${out}]`);
-      } else {
-        filterParts.push(`${cur}[a${members[i].idx}]concat=n=2:v=0:a=1[${out}]`);
+    audioRuns.forEach((run, r) => {
+      const members = run.clips
+        .map((clip, i) => ({ clip, idx: run.idxs[i] }))
+        .filter((m) => m.clip.hasAudio && !m.clip.muted);
+      if (members.length === 0) return;
+      let cur = `[a${members[0].idx}]`;
+      for (let i = 1; i < members.length; i++) {
+        const d = clampOverlap(members[i].clip.transition?.duration ?? 0, members[i - 1].clip.outDuration, members[i].clip.outDuration, fps);
+        const out = `arun${r}_${i}`;
+        if (d > 0) {
+          filterParts.push(`${cur}[a${members[i].idx}]acrossfade=d=${d.toFixed(3)}[${out}]`);
+        } else {
+          filterParts.push(`${cur}[a${members[i].idx}]concat=n=2:v=0:a=1[${out}]`);
+        }
+        cur = `[${out}]`;
       }
-      cur = `[${out}]`;
-    }
-    // Place at the run start; for a single clip also apply its audio slip (J/L).
-    const offset = run.clips.length === 1 ? run.clips[0].audioOffset ?? 0 : 0;
-    const startMs = Math.round(Math.max(0, run.startSec + offset) * 1000);
-    if (startMs > 0) {
-      const out = `ad${r}`;
-      filterParts.push(`${cur}adelay=${startMs}:all=1[${out}]`);
-      cur = `[${out}]`;
-    }
-    audioLabels.push(cur);
-  });
+      // Place at the run start; for a single clip also apply its audio slip (J/L).
+      const offset = run.clips.length === 1 ? run.clips[0].audioOffset ?? 0 : 0;
+      const startMs = Math.round(Math.max(0, run.startSec + offset) * 1000);
+      if (startMs > 0) {
+        const out = `ad${r}`;
+        filterParts.push(`${cur}adelay=${startMs}:all=1[${out}]`);
+        cur = `[${out}]`;
+      }
+      audioLabels.push(cur);
+    });
 
-  filterParts.push(
-    `${audioLabels.join("")}amix=inputs=${audioLabels.length}:duration=longest:normalize=0[amixraw]`,
-  );
-  filterParts.push(`[amixraw]apad,atrim=0:${total.toFixed(6)},aresample=48000[paud]`);
+    filterParts.push(
+      `${audioLabels.join("")}amix=inputs=${audioLabels.length}:duration=longest:normalize=0[amixraw]`,
+    );
+    filterParts.push(`[amixraw]apad,atrim=0:${total.toFixed(6)},aresample=48000[paud]`);
 
-  // ---- background music -----------------------------------------------------
-  let audioOut = "[paud]";
-  if (music) {
-    const mIdx = nextIndex++;
-    inputArgs.push("-stream_loop", "-1", "-t", total.toFixed(6), "-i", music.path);
-    const mSteps = ["asetpts=PTS-STARTPTS", "aresample=48000", `volume=${music.volume}`];
-    if (music.fadeIn && music.fadeIn > 0) mSteps.push(`afade=t=in:st=0:d=${music.fadeIn.toFixed(3)}`);
-    if (music.fadeOut && music.fadeOut > 0) {
-      mSteps.push(`afade=t=out:st=${Math.max(0, total - music.fadeOut).toFixed(3)}:d=${music.fadeOut.toFixed(3)}`);
+    // ---- background music ---------------------------------------------------
+    audioOut = "[paud]";
+    if (music) {
+      const mIdx = nextIndex++;
+      inputArgs.push("-stream_loop", "-1", "-t", total.toFixed(6), "-i", music.path);
+      const mSteps = ["asetpts=PTS-STARTPTS", "aresample=48000", `volume=${music.volume}`];
+      if (music.fadeIn && music.fadeIn > 0) mSteps.push(`afade=t=in:st=0:d=${music.fadeIn.toFixed(3)}`);
+      if (music.fadeOut && music.fadeOut > 0) {
+        mSteps.push(`afade=t=out:st=${Math.max(0, total - music.fadeOut).toFixed(3)}:d=${music.fadeOut.toFixed(3)}`);
+      }
+      filterParts.push(`[${mIdx}:a]${mSteps.join(",")}[mraw]`);
+      if (music.duck) {
+        filterParts.push(`[paud]asplit=2[pmix][pside]`);
+        filterParts.push(`[mraw][pside]sidechaincompress=threshold=0.03:ratio=8:attack=20:release=300:level_sc=1[mduck]`);
+        filterParts.push(`[pmix][mduck]amix=inputs=2:duration=first:normalize=0[outa]`);
+      } else {
+        filterParts.push(`[paud][mraw]amix=inputs=2:duration=first:normalize=0[outa]`);
+      }
+      audioOut = "[outa]";
     }
-    filterParts.push(`[${mIdx}:a]${mSteps.join(",")}[mraw]`);
-    if (music.duck) {
-      filterParts.push(`[paud]asplit=2[pmix][pside]`);
-      filterParts.push(`[mraw][pside]sidechaincompress=threshold=0.03:ratio=8:attack=20:release=300:level_sc=1[mduck]`);
-      filterParts.push(`[pmix][mduck]amix=inputs=2:duration=first:normalize=0[outa]`);
-    } else {
-      filterParts.push(`[paud][mraw]amix=inputs=2:duration=first:normalize=0[outa]`);
+
+    // ---- loudness normalization (deliverable presets) -----------------------
+    // Single-pass dynamic loudnorm on the final mix. loudnorm upsamples to
+    // 192kHz internally, so resample back for the encoder.
+    if (settings?.loudnessTarget !== undefined) {
+      const I = clampN(settings.loudnessTarget, -70, -5);
+      const TP = clampN(settings.truePeak ?? -1.5, -9, 0);
+      filterParts.push(`${audioOut}loudnorm=I=${num(I)}:TP=${num(TP)}:LRA=11,aresample=48000[louda]`);
+      audioOut = "[louda]";
     }
-    audioOut = "[outa]";
   }
 
   const filterComplex = filterParts.join(";");
+
+  const maps: string[] = [];
+  if (!opts.audioOnly) maps.push("-map", "[outv]");
+  if (!opts.videoOnly) maps.push("-map", audioOut);
+
+  let codecArgs: string[];
+  if (opts.videoOnly) {
+    // Segment cache entries: video codec only, no faststart, optional MPEG-TS.
+    codecArgs = exportCodecArgs(settings, profile, outputPath, opts.hwEncoder)
+      .filter((_, i, arr) => {
+        // Strip the audio codec/bitrate + faststart pairs.
+        const drop = (flag: string) => {
+          const at = arr.indexOf(flag);
+          return at !== -1 && (i === at || i === at + 1);
+        };
+        return !drop("-c:a") && !drop("-b:a") && !drop("-movflags");
+      })
+      .concat("-an");
+  } else if (opts.audioOnly) {
+    codecArgs = ["-vn", "-c:a", "aac", "-b:a", profile.audioBitrate];
+  } else {
+    codecArgs = exportCodecArgs(settings, profile, outputPath, opts.hwEncoder);
+  }
+  // Zero-based timestamps make TS segments concat cleanly and extract reliably.
+  if (opts.mpegts) codecArgs.push("-muxdelay", "0", "-muxpreload", "0", "-f", "mpegts");
 
   const args: string[] = [
     "-hide_banner",
     ...inputArgs,
     "-filter_complex",
     filterComplex,
-    "-map",
-    "[outv]",
-    "-map",
-    audioOut,
-    ...exportCodecArgs(settings, profile, outputPath),
+    ...maps,
+    ...codecArgs,
     "-progress",
     "pipe:1",
     "-nostats",

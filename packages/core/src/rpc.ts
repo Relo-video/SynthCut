@@ -120,7 +120,8 @@ function summarizeTimeline(engine: EditorEngine) {
         return {
           clipId: clip.id,
           assetId: clip.assetId,
-          asset: asset?.name ?? "(missing)",
+          asset: clip.adjustment ? "(adjustment layer)" : asset?.name ?? "(missing)",
+          adjustment: clip.adjustment || undefined,
           startFrame: clip.startFrame,
           durationFrames: clipDurationFrames(clip),
           endFrame: clipEndFrame(clip),
@@ -141,6 +142,8 @@ function summarizeTimeline(engine: EditorEngine) {
     totalFrames: engine.timelineDurationFrames(),
     totalDuration: Number(engine.timelineDuration().toFixed(3)),
     trackCount: project.tracks.length,
+    // The human↔AI annotation channel: named markers with notes.
+    markers: project.markers ?? [],
     tracks,
   };
 }
@@ -154,9 +157,10 @@ const clipPlacement = {
 
 export const methods = {
   get_state: {
-    description: "Return the full current project state (assets, tracks, clips, canvas). All timing is in frames.",
+    description:
+      "Return the full current project state (assets, tracks, clips, canvas) plus `recovery` — if a crash-recovery snapshot exists ({available:true, path}), an earlier session ended with unsaved work; offer to restore it via load_project on that path. All timing is in frames.",
     schema: empty,
-    handler: (engine) => engine.getProject(),
+    handler: (engine) => ({ ...engine.getProject(), recovery: engine.recoveryInfo() }),
   },
 
   timeline_summary: {
@@ -270,6 +274,19 @@ export const methods = {
       .object({ assetId: z.string(), sourceInFrame: z.number().int().min(0).optional(), sourceOutFrame: z.number().int().min(0).optional() })
       .strict(),
     handler: (engine, p) => ({ clip: engine.appendClip(p.assetId, p.sourceInFrame, p.sourceOutFrame) }),
+  },
+
+  add_adjustment_clip: {
+    description:
+      "Place an ADJUSTMENT LAYER: a source-less clip whose color grade and effects apply to the COMPOSITE of every video track below it, only while it's active [startFrame, startFrame+durationFrames). Defaults to the topmost video track (grades the whole stack). After placing it, use the normal look tools on its clipId — color_grade, apply_color, apply_lut, apply_effect — and move/trim/split it like any clip. The pro way to grade a whole scene at once instead of per-clip.",
+    schema: z
+      .object({
+        trackIndex: z.number().int().min(0).optional(),
+        startFrame: z.number().int().min(0),
+        durationFrames: z.number().int().positive(),
+      })
+      .strict(),
+    handler: (engine, p) => ({ clip: engine.addAdjustmentClip(p) }),
   },
 
   insert_clip: {
@@ -588,7 +605,7 @@ export const methods = {
   // ---- text & captions ------------------------------------------------------
   add_text: {
     description:
-      "Add a burned-in text overlay (title, lower-third, kinetic word, label) to a clip. Compose the look freely with the style fields: any installed `font` or a font-file path, fontSize/color, outline (outlineColor+outlineWidth), drop shadow (shadowColor+shadowX/shadowY), background box, and placement via keyword `position` or x/y (0..1). startFrame/endFrame (frames from the clip's start) limit when it shows; omit to show for the whole clip. Returns the overlay id.",
+      "Add a burned-in text overlay (title, lower-third, kinetic word, label) to a clip. Compose the look freely with the style fields: any installed `font` or a font-file path, fontSize/color, outline (outlineColor+outlineWidth), drop shadow (shadowColor+shadowX/shadowY), background box, and placement via keyword `position` or x/y (0..1). Long text AUTO-WRAPS to the canvas width; include your own \\n newlines to control the breaks exactly (then no auto-wrap). startFrame/endFrame (frames from the clip's start) limit when it shows; omit to show for the whole clip. Returns the overlay id.",
     schema: z
       .object({
         clipId: z.string(),
@@ -714,6 +731,25 @@ export const methods = {
     },
   },
 
+  export_captions: {
+    description:
+      "Write ALL timeline captions to a sidecar subtitle file (SubRip .srt or WebVTT .vtt) with ABSOLUTE timeline times — the deliverable alternative to burned-in captions (platforms like YouTube accept sidecars and let viewers toggle them). format defaults from the path extension. Fails with guidance if no clip has captions. Returns {path, cueCount, format}.",
+    schema: z
+      .object({ path: z.string().min(1), format: z.enum(["srt", "vtt"]).optional() })
+      .strict(),
+    handler: async (engine, p) => engine.exportCaptions(p.path, p.format),
+  },
+
+  import_captions: {
+    description:
+      "Attach a sidecar subtitle file (.srt or .vtt, auto-detected) to a clip as its caption track (REPLACES existing captions; style is kept). Cue times are ABSOLUTE timeline seconds and are converted to clip-local frames; cues outside the clip's window are dropped (reported in `dropped`). Style afterwards with set_caption_style.",
+    schema: z.object({ clipId: z.string(), path: z.string().min(1) }).strict(),
+    handler: async (engine, p) => {
+      const r = await engine.importCaptions(p.clipId, p.path);
+      return { clipId: r.clip.id, cueCount: r.cueCount, dropped: r.dropped };
+    },
+  },
+
   get_frame: {
     description:
       "Render a single composited frame of the CURRENT timeline at `atSeconds` (the whole multi-track edit — layering, cuts, color, captions, overlays, transitions) and return it as an image so you can SEE the result and self-correct. Your eyes: after a visual edit, call get_frame to verify before continuing. Defaults to the timeline midpoint.",
@@ -833,8 +869,26 @@ export const methods = {
 
   set_markers: {
     description:
-      "Replace the timeline's marker flags (frame positions). Markers are saved with the project and act as snap targets when moving/trimming clips. Pass the full list each time (empty clears them).",
-    schema: z.object({ frames: z.array(z.number().int().min(0)).max(2000) }).strict(),
+      "Replace the timeline's markers. Each entry is a bare frame number OR a named marker {frame, name?, color?, note?} — the annotation channel between you and the human: leave `note`s at moments that need review ('trim this pause?', 'b-roll here'), and read theirs from timeline_summary. Markers are saved with the project and act as snap targets when moving/trimming clips. Pass the FULL list each time (empty clears them; to add one, send the existing markers plus the new one).",
+    schema: z
+      .object({
+        frames: z
+          .array(
+            z.union([
+              z.number().int().min(0),
+              z
+                .object({
+                  frame: z.number().int().min(0),
+                  name: z.string().max(120).optional(),
+                  color: z.string().max(40).optional(),
+                  note: z.string().max(2000).optional(),
+                })
+                .strict(),
+            ]),
+          )
+          .max(2000),
+      })
+      .strict(),
     handler: (engine, p) => {
       engine.setMarkers(p.frames);
       return { markers: engine.getProject().markers ?? [] };
@@ -861,7 +915,7 @@ export const methods = {
 
   export_video: {
     description:
-      "Render the final video to an absolute output path. Pick a per-platform `preset` (youtube, youtube_hevc, social=Reels/Shorts/TikTok, square, web=webm/vp9, master=near-lossless mov) and/or set fields directly: container (mp4|mov|webm), videoCodec (h264|h265|vp9), quality (CRF; lower=better/bigger), videoBitrate (e.g. '8M', overrides quality), preset/encoder speed, audioCodec (aac|opus), audioBitrate. Explicit fields override the named preset. Resolution & fps come from the canvas (set_project_settings). The output extension also implies the container. Returns {path, duration}.",
+      "Render the final video to an absolute output path. Pick a per-platform `preset` (youtube, youtube_hevc, social=Reels/Shorts/TikTok, square, web=webm/vp9, master=near-lossless mov) and/or set fields directly: container (mp4|mov|webm), videoCodec (h264|h265|vp9), quality (CRF; lower=better/bigger), videoBitrate (e.g. '8M', overrides quality), preset/encoder speed, audioCodec (aac|opus), audioBitrate. Explicit fields override the named preset. Resolution & fps come from the canvas (set_project_settings). The output extension also implies the container. Default BLOCKS until done and returns {path, duration}. For long timelines (>~2 min) pass background:true — it returns {jobId} immediately; poll list_jobs for progress (fraction 0..1) and stop it with cancel_job. A canceled export deletes its partial file. `hardware: true` opts into GPU encoding (NVENC/QSV/AMF/VideoToolbox) — 2-10× faster but slightly lower quality-per-bit than the default software x264/x265; good for drafts and time-pressed deliveries, skip it for the final master. LOUDNESS: platform presets normalize the mix (youtube/social/square → -14 LUFS, web → -16, master → untouched); override with loudnessTarget (LUFS) + truePeak (dBTP, default -1.5), or pass a preset-less export for no normalization.",
     schema: z
       .object({
         outputPath: z.string().min(1),
@@ -873,6 +927,10 @@ export const methods = {
         encoderPreset: z.string().optional(),
         audioCodec: z.enum(["aac", "opus"]).optional(),
         audioBitrate: z.string().optional(),
+        background: z.boolean().optional(),
+        hardware: z.boolean().optional(),
+        loudnessTarget: z.number().min(-70).max(-5).optional(),
+        truePeak: z.number().min(-9).max(0).optional(),
       })
       .strict(),
     handler: async (engine, p) => {
@@ -886,8 +944,38 @@ export const methods = {
         ...(p.encoderPreset ? { preset: p.encoderPreset } : {}),
         ...(p.audioCodec ? { audioCodec: p.audioCodec } : {}),
         ...(p.audioBitrate ? { audioBitrate: p.audioBitrate } : {}),
+        ...(p.hardware !== undefined ? { hardware: p.hardware } : {}),
+        ...(p.loudnessTarget !== undefined ? { loudnessTarget: p.loudnessTarget } : {}),
+        ...(p.truePeak !== undefined ? { truePeak: p.truePeak } : {}),
       };
+      if (p.background) {
+        const { job } = engine.startExportJob(p.outputPath, settings);
+        return { jobId: job.id, status: job.status, label: job.label };
+      }
       return engine.exportVideo(p.outputPath, settings);
+    },
+  },
+
+  // ---- jobs (long-running work) ----------------------------------------------
+  list_jobs: {
+    description:
+      "List long-running jobs (export, preview, transcribe, reframe, stabilize, proxy, visual indexing, motion graphics): {id, type, label, status running|done|error|canceled, fraction 0..1, startedAt, endedAt?, result?, error?}. Pass activeOnly:true for just the currently-running ones. Use this to poll a background export's progress or to see what the engine is busy with.",
+    schema: z.object({ activeOnly: z.boolean().optional() }).strict(),
+    handler: (engine, p) => ({ jobs: engine.jobs.list(p.activeOnly ?? false) }),
+  },
+
+  cancel_job: {
+    description:
+      "Cancel a RUNNING job by its jobId (from list_jobs or a background export_video). Stops the underlying ffmpeg/model work; a canceled export deletes its partial output file. Returns {canceled:false} if the job already finished or the id is unknown — check list_jobs in that case.",
+    schema: z.object({ jobId: z.string().min(1) }).strict(),
+    handler: (engine, p) => {
+      const canceled = engine.jobs.cancel(p.jobId);
+      if (!canceled && !engine.jobs.get(p.jobId)) {
+        throw new Error(
+          `No job with id "${p.jobId}". Call list_jobs to see running/recent jobs and use one of their ids.`,
+        );
+      }
+      return { canceled, job: engine.jobs.get(p.jobId) };
     },
   },
 
@@ -946,7 +1034,7 @@ export const methods = {
 
   index_transcript: {
     description:
-      "Transcribe a WHOLE asset (local Whisper) and cache the spoken-word transcript on it so it becomes searchable. Run once per talking asset; idempotent. Returns the segment count. (Use generate_captions instead when you want burned-in on-screen captions for a placed clip.)",
+      "Transcribe a WHOLE asset (local Whisper) and cache its transcript: segment cues AND word-level timestamps, making the asset searchable (search_transcript/locate_in_timeline) and TEXT-EDITABLE (delete_transcript_ranges/tighten_talk/edit_by_transcript). Run once per talking asset; idempotent. Returns {segmentCount, wordCount}. (Use generate_captions instead when you want burned-in on-screen captions for a placed clip.)",
     schema: z.object({ assetId: z.string(), model: z.enum(WHISPER_MODELS).optional(), language: z.string().optional() }).strict(),
     handler: async (engine, p) => engine.indexTranscript(p.assetId, { model: p.model, language: p.language }),
   },
@@ -960,9 +1048,70 @@ export const methods = {
 
   get_transcript: {
     description:
-      "Return the cached spoken-word transcript of an asset ({segments:[{start,end,text}] in seconds, model, language}), or null if not indexed yet (run index_transcript first). Read the real spoken content to decide cuts/quotes — don't guess from filenames.",
+      "Return the cached transcript of an asset: {segments:[{start,end,text}] in seconds} AND numbered words [{i, start, end, text}] — the stable word indices that delete_transcript_ranges and edit_by_transcript address. Null if not indexed yet (run index_transcript first). Read the real spoken content to decide cuts/quotes — don't guess from filenames.",
     schema: z.object({ assetId: z.string() }).strict(),
-    handler: (engine, p) => ({ transcript: engine.getTranscript(p.assetId) }),
+    handler: (engine, p) => {
+      const t = engine.getTranscript(p.assetId);
+      if (!t) return { transcript: null };
+      return {
+        transcript: {
+          segments: t.segments,
+          words: (t.words ?? []).map((w, i) => ({ i, start: Number(w.start.toFixed(3)), end: Number(w.end.toFixed(3)), text: w.text })),
+          model: t.model,
+          language: t.language,
+        },
+      };
+    },
+  },
+
+  // ---- text-based editing (Descript-style, agent-driven) ---------------------
+  delete_transcript_ranges: {
+    description:
+      "TEXT-BASED EDITING: cut spoken content by WORD RANGE. Pass word indices from get_transcript's numbered words; every placed clip of that asset has the matching footage removed as frame-accurate ripple cuts (gaps close), all in ONE undo step. Optional padFrames expands each cut by that many frames on both sides (breathing room). Fails with guidance if the asset has no word-level transcript (run index_transcript) or no clips on the timeline. Returns {cuts, framesRemoved, removedText, ranges}.",
+    schema: z
+      .object({
+        assetId: z.string(),
+        ranges: z
+          .array(z.object({ fromWord: z.number().int().min(0), toWord: z.number().int().min(0) }).strict())
+          .min(1),
+        padFrames: z.number().int().min(0).max(60).optional(),
+      })
+      .strict(),
+    handler: (engine, p) => engine.deleteTranscriptRanges(p.assetId, p.ranges, p.padFrames ?? 0),
+  },
+
+  tighten_talk: {
+    description:
+      "ONE-CALL talking-head cleanup: transcribes the clip's asset if needed (word-level), then removes filler words (default: um/uh/erm/hmm/…, the 'you know' bigram, and 'like' only when isolated by ≥0.25s pauses) and shrinks every pause longer than maxPauseSec (default 1.0s) down to half of it — as ONE ripple pass / undo step. Linked clips (detached audio) are cut in sync. padFrames (default 1) adds breathing room around each cut. Returns a reviewable report: each removed item with text + seconds, cut count, frames removed, old vs new duration. Run render_preview after to hear the result; undo reverts everything.",
+    schema: z
+      .object({
+        clipId: z.string(),
+        removeFillers: z.boolean().optional(),
+        fillerWords: z.array(z.string().min(1)).max(100).optional(),
+        maxPauseSec: z.number().min(0.2).max(10).optional(),
+        padFrames: z.number().int().min(0).max(60).optional(),
+      })
+      .strict(),
+    handler: async (engine, p) =>
+      engine.tightenTalk(p.clipId, {
+        removeFillers: p.removeFillers,
+        fillerWords: p.fillerWords,
+        maxPauseSec: p.maxPauseSec,
+        padFrames: p.padFrames,
+      }),
+  },
+
+  edit_by_transcript: {
+    description:
+      "'Here is my script — assemble the cut': pass the edited TEXT you want to keep (in playback order) and the engine diffs it against the asset's word-level transcript (LCS), then APPENDS one clip per kept span to the end of the base video track. Quote the transcript's real wording (read it with get_transcript first); paraphrases won't match. padSec (default 0.08) widens each span slightly so words aren't clipped. Returns the created clipIds, the kept spans with text, and match stats. Fails with guidance if nothing matches or the transcript isn't indexed.",
+    schema: z
+      .object({
+        assetId: z.string(),
+        keep: z.string().min(1),
+        padSec: z.number().min(0).max(1).optional(),
+      })
+      .strict(),
+    handler: (engine, p) => engine.editByTranscript(p.assetId, p.keep, p.padSec ?? 0.08),
   },
 
   locate_in_timeline: {
@@ -1002,6 +1151,25 @@ export const methods = {
       "Align a clip to a reference clip by SOUND (cross-correlates their audio — great for multi-cam/second-take sync). Measures the time offset and, unless apply:false, MOVES the clip on the timeline so its audio lines up with the reference. Returns {offsetSeconds, offsetFrames, confidence (−1..1), applied}.",
     schema: z.object({ clipId: z.string(), referenceClipId: z.string(), apply: z.boolean().optional() }).strict(),
     handler: async (engine, p) => engine.syncAudio(p.clipId, p.referenceClipId, p.apply ?? true),
+  },
+
+  // ---- OpenTimelineIO interop -------------------------------------------------
+  export_otio: {
+    description:
+      "Write the timeline as an OpenTimelineIO (.otio) JSON file at the given absolute path — the industry interchange format (DaVinci Resolve, Premiere via extension, Hiero, RV all read it). Tracks/clips/gaps/transitions map to OTIO natively; SynthCut-only data (effects stacks, keyframes, captions, graphics, adjustment layers) rides in metadata.synthcut so importing back into SynthCut is LOSSLESS. Use it to hand the edit off for finishing.",
+    schema: z.object({ path: z.string().min(1) }).strict(),
+    handler: async (engine, p) => engine.exportOtio(p.path),
+  },
+
+  import_otio: {
+    description:
+      "Load an OpenTimelineIO (.otio) JSON file as the CURRENT project (unsaved edits are auto-saved first). Referenced media is probed from disk; files that can't be found are imported as OFFLINE placeholder assets (asset.missing=true — those clips won't render until the file exists at that path or you replace them). Returns {warnings} for OTIO features that couldn't be expressed and {missing} paths. A file exported by export_otio restores losslessly.",
+    schema: z.object({ path: z.string().min(1) }).strict(),
+    handler: async (engine, p) => {
+      const autosaved = await engine.autoSaveIfDirty();
+      const r = await engine.importOtio(p.path);
+      return { project: r.project, warnings: r.warnings, missing: r.missing, autosaved };
+    },
   },
 
   save_project: {

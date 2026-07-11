@@ -62,12 +62,15 @@ async function main() {
   check(phraseHits.length >= 1 && phraseHits[0].text.includes("espresso"), "exact phrase ranks first");
   check(rankTranscript(fakeAssets, "bicycle", 10).length === 0, "no false matches");
 
-  // 3. transcript → timeline frames (inject transcript on the real asset, place a clip).
+  // 3. transcript → timeline frames (inject a transcript into the engine's
+  // asset cache — transcripts live there now, outside the undo history).
   console.log("3. locate_in_timeline...");
-  engine.getAsset(a.id).transcript = { segments: [
-    { start: 0.5, end: 1.5, text: "hello world" },
-    { start: 3.0, end: 3.8, text: "goodbye now" },
-  ] };
+  (engine as unknown as { setCachedTranscript(id: string, t: unknown): void }).setCachedTranscript(a.id, {
+    segments: [
+      { start: 0.5, end: 1.5, text: "hello world" },
+      { start: 3.0, end: 3.8, text: "goodbye now" },
+    ],
+  });
   engine.appendClip(a.id); // whole asset on the base track at frame 0
   const matches = engine.locateInTimeline("goodbye", 10);
   check(matches.length === 1, "one timeline match for 'goodbye'");

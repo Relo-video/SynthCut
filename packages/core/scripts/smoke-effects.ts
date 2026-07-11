@@ -18,30 +18,33 @@ async function main() {
   const dataDir = mkdtempSync(join(tmpdir(), "aive-fx-"));
   const engine = new EditorEngine(dataDir);
 
-  const a = await engine.importVideo(clipA); // 5s
-  const b = await engine.importVideo(clipB); // 4s
+  const a = await engine.importVideo(clipA);
+  const b = await engine.importVideo(clipB);
   const fps = engine.fps;
-  const c1 = engine.appendClip(a.id); // 5s clip
-  const c2 = engine.appendClip(b.id); // 4s clip
-  console.log(`baseline timeline: ${engine.timelineDuration().toFixed(2)}s (expect ~9)`);
+  const c1 = engine.appendClip(a.id);
+  const c2 = engine.appendClip(b.id);
+  // Expectations derive from the PROBED durations so any test media works.
+  console.log(`baseline timeline: ${engine.timelineDuration().toFixed(2)}s (expect ~${(a.duration + b.duration).toFixed(1)})`);
 
-  // Speed up clip A by 2x -> its OWN footprint 5s becomes 2.5s. In the absolute
+  // Speed up clip A by 2x -> its OWN footprint halves. In the absolute
   // (multi-track) model this does NOT ripple clip B — B keeps its position, so a
   // gap opens. Verify A's footprint shrank rather than the whole-timeline length.
   engine.setClipEffects(c1.id, { speed: 2 });
   const aDur = engine.clipDuration(c1);
-  console.log(`after 2x speed on A: clip footprint ${aDur.toFixed(2)}s (expect ~2.5)`);
-  if (Math.abs(aDur - 2.5) > 0.1) throw new Error(`speed math wrong: clip footprint ${aDur}`);
+  const wantA = a.duration / 2;
+  console.log(`after 2x speed on A: clip footprint ${aDur.toFixed(2)}s (expect ~${wantA.toFixed(2)})`);
+  if (Math.abs(aDur - wantA) > 0.1) throw new Error(`speed math wrong: clip footprint ${aDur}`);
 
   // Apply a warm color grade + fades to A, volume + slow-mo to B.
   engine.setClipEffects(c1.id, { color: { contrast: 1.15, saturation: 1.2, brightness: 0.03 }, fadeInFrames: Math.round(0.5 * fps), fadeOutFrames: Math.round(0.5 * fps) });
-  engine.setClipEffects(c2.id, { speed: 0.5, volume: 0.4 }); // slow-mo b: 4s -> 8s
+  engine.setClipEffects(c2.id, { speed: 0.5, volume: 0.4 }); // slow-mo: footprint doubles
 
   // Close the gap left by A's speed change: place B right after A (positional).
   engine.moveClip(c2.id, Math.round(engine.clipDuration(c1) * fps));
   const total = engine.timelineDuration();
-  console.log(`final timeline: ${total.toFixed(2)}s (expect ~10.5 = 2.5 + 8)`);
-  if (Math.abs(total - 10.5) > 0.15) throw new Error(`final duration wrong: ${total}`);
+  const wantTotal = wantA + b.duration * 2;
+  console.log(`final timeline: ${total.toFixed(2)}s (expect ~${wantTotal.toFixed(1)})`);
+  if (Math.abs(total - wantTotal) > 0.15) throw new Error(`final duration wrong: ${total}`);
 
   // Split the sped-up clip to ensure split math respects speed.
   const { left, right } = engine.splitClip(c1.id, Math.round(1 * fps)); // split A at 1s timeline (=2s source)

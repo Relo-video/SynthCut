@@ -97,7 +97,7 @@ export function buildSegments(clips: Clip[], assetById: Map<string, MediaAsset>,
     const srcOut = clip.sourceOutFrame / fps;
     const tlDur = Math.max(0.01, (srcOut - srcIn) / speed);
     const start = clip.startFrame / fps;
-    const asset = assetById.get(clip.assetId);
+    const asset = clip.assetId ? assetById.get(clip.assetId) : undefined; // adjustment layers have no source
     // Preview prefers a low-res proxy when one exists; export uses the original.
     return { clip, asset, index, start, end: start + tlDur, tlDur, speed, srcIn, srcOut, path: asset?.proxyPath ?? asset?.path, fps };
   });

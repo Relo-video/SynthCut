@@ -9,7 +9,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, MutableRefObject, PointerEvent as ReactPointerEvent, RefObject } from "react";
-import type { MediaAsset, MusicSettings, Project, Track } from "./types";
+import type { Marker, MediaAsset, MusicSettings, Project, Track } from "./types";
 import { clipDurationFrames } from "./types";
 import {
   buildSegments, fmtTime, tickInterval, usePlaybackValue,
@@ -66,8 +66,8 @@ interface Props {
   onSetTrack: (trackIndex: number, patch: Record<string, unknown>) => void;
   onAddTrack: (kind: "video" | "audio") => void;
   onRemoveTrack: (trackIndex: number) => void;
-  /** Persist the timeline markers (frames) — saved with the project. */
-  onSetMarkers: (frames: number[]) => void;
+  /** Persist the timeline markers — saved with the project. */
+  onSetMarkers: (markers: Marker[]) => void;
   /** Move/resize a text overlay, motion graphic, or caption cue (clip-local frames). */
   onSetElementWindow: (
     kind: "text" | "graphic" | "caption",
@@ -147,11 +147,11 @@ export function Timeline(props: Props) {
   // Markers are persisted on the project (saved in the .aive, shared with the AI).
   const markers = useMemo(() => project?.markers ?? [], [project]);
   const addMarkerAt = useCallback(
-    (frame: number) => { if (!markers.includes(frame)) onSetMarkers([...markers, frame]); },
+    (frame: number) => { if (!markers.some((m) => m.frame === frame)) onSetMarkers([...markers, { frame }]); },
     [markers, onSetMarkers],
   );
   const removeMarkerAt = useCallback(
-    (frame: number) => onSetMarkers(markers.filter((m) => m !== frame)),
+    (frame: number) => onSetMarkers(markers.filter((m) => m.frame !== frame)),
     [markers, onSetMarkers],
   );
   const [drag, setDrag] = useState<Drag | null>(null);
@@ -265,7 +265,7 @@ export function Timeline(props: Props) {
   // ----- snapping ------------------------------------------------------------
   const snapTargets = useCallback(
     (excludeClipId: string): number[] => {
-      const out: number[] = [0, Math.round(store.get().playhead * fps), ...markers];
+      const out: number[] = [0, Math.round(store.get().playhead * fps), ...markers.map((m) => m.frame)];
       for (const t of rows) {
         for (const c of t.clips) {
           if (c.id === excludeClipId) continue;
@@ -466,13 +466,18 @@ export function Timeline(props: Props) {
               {ticks.map((tick, i) => (
                 <span key={i} className="tl-tick" style={{ left: tick.x }}><span className="tl-tick-label">{fmtTime(tick.t)}</span></span>
               ))}
-              {markers.map((f) => (
-                <span key={f} className="tl-marker" style={{ left: (f / fps) * pps } as CSSProperties}
-                  title={`Marker ${fmtTime(f / fps)} — click to seek, alt-click to remove`}
+              {markers.map((m) => (
+                <span key={m.frame} className="tl-marker"
+                  style={{ left: (m.frame / fps) * pps, ...(m.color ? { background: m.color } : {}) } as CSSProperties}
+                  title={[
+                    m.name ? `${m.name} — ${fmtTime(m.frame / fps)}` : `Marker ${fmtTime(m.frame / fps)}`,
+                    m.note,
+                    "click to seek, alt-click to remove",
+                  ].filter(Boolean).join("\n")}
                   onPointerDown={(e) => {
                     e.stopPropagation();
-                    if (e.altKey) removeMarkerAt(f);
-                    else onSeek(f / fps);
+                    if (e.altKey) removeMarkerAt(m.frame);
+                    else onSeek(m.frame / fps);
                   }} />
               ))}
             </div>
@@ -678,7 +683,7 @@ function ClipBlock({
       )}
 
       <div className="tl-clip-body">
-        <span className="tl-clip-name"><span className="tl-clip-idx">{seg.index + 1}</span>{seg.asset?.name ?? "—"}</span>
+        <span className="tl-clip-name"><span className="tl-clip-idx">{seg.index + 1}</span>{seg.clip.adjustment ? "Adjustment" : seg.asset?.name ?? "—"}</span>
         <span className={`tl-clip-meta ${muted ? "muted" : ""}`}>
           {seg.asset?.hasAudio && <Waveform size={11} />}
           <span className="tl-clip-dur">{fmtTime(durFrames / fps)}</span>

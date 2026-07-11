@@ -88,6 +88,13 @@ export interface ActiveClip {
   graphics: RenderGraphic[];
   /** Active caption cue at this instant (drawable clips only). */
   caption?: { text: string; style?: TextStyle };
+  /**
+   * Present for an ADJUSTMENT layer active at this instant: its CSS color-proxy
+   * filter, to be applied to the composite of every layer below (the renderer
+   * draws lower layers to an offscreen canvas, then draws that through
+   * ctx.filter). Mirrors the FFmpeg bake in graph.ts (split→filter→overlay).
+   */
+  adjust?: { colorFilter: string };
 }
 
 /** The full set of layers to render for one frame, drawables in bottom→top order. */
@@ -177,6 +184,27 @@ export function activeLayersAt(
       const asset = seg.asset;
       const gain = segmentGain(seg, active, t);
       const srcTime = sourceTimeFor(seg, t);
+
+      // ADJUSTMENT layer: no source — contribute its color-proxy filter so the
+      // renderer applies it to the composite of everything below.
+      if (seg.clip.adjustment && track.kind === "video" && !track.hidden) {
+        out.push({
+          clipId: seg.clip.id,
+          trackIndex: track.index,
+          trackKind: track.kind,
+          assetName: "Adjustment",
+          srcTime: 0,
+          rate: 1,
+          gain,
+          overlays: [],
+          graphics: [],
+          adjust: {
+            colorFilter: colorFilter(seg.clip.effects?.color, seg.clip.effects?.grade, seg.clip.effects?.filters),
+          },
+        });
+        continue;
+      }
+
       // A hidden video track still contributes audio — only its drawing is
       // suppressed (mirrors the engine's separate hidden/muted flags).
       const drawable = track.kind === "video" && !track.hidden && !!asset?.hasVideo;

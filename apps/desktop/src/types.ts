@@ -41,7 +41,12 @@ export interface MediaAsset {
   /** Browser-playable preview proxy (alpha .webm) for motion-graphic overlays. */
   previewPath?: string;
   folderId?: string;
+  /** Present only in .aive files; live state carries transcriptIndexed instead. */
   transcript?: AssetTranscript;
+  /** True when the asset's transcript is indexed (the live-state marker). */
+  transcriptIndexed?: boolean;
+  /** Why the background proxy transcode failed, if it did. */
+  proxyError?: string;
   /** Present once visually indexed (shape mirrors core; not needed in detail by the UI). */
   visualSig?: { samples: unknown[]; bins: number };
 }
@@ -198,7 +203,10 @@ export interface GraphicOverlay {
 
 export interface Clip {
   id: string;
-  assetId: string;
+  /** Source asset — absent for adjustment layers. */
+  assetId?: string;
+  /** True = adjustment layer: its grade/effects apply to all video below it. */
+  adjustment?: boolean;
   startFrame: number;
   sourceInFrame: number;
   sourceOutFrame: number;
@@ -233,6 +241,14 @@ export interface Track {
   clips: Clip[];
 }
 
+/** A named timeline marker (frame flag with optional annotation). */
+export interface Marker {
+  frame: number;
+  name?: string;
+  color?: string;
+  note?: string;
+}
+
 export interface Project {
   id: string;
   name: string;
@@ -243,8 +259,8 @@ export interface Project {
   folders?: MediaFolder[];
   tracks: Track[];
   music?: MusicSettings;
-  /** Timeline-wide marker positions in frames (persisted; snap targets). */
-  markers?: number[];
+  /** Timeline-wide NAMED markers (persisted; snap targets + annotations). */
+  markers?: Marker[];
   revision: number;
   schemaVersion: number;
   createdAt: number;

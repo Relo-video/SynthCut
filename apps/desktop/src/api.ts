@@ -21,9 +21,14 @@ export class CoreApi {
   /** Absolute .aive path of the open project, or null if never saved. */
   filePath: string | null = null;
 
-  constructor(readonly port: number) {
+  constructor(
+    readonly port: number,
+    /** Session token from the core's server.json (required on every request). */
+    readonly token: string = "",
+  ) {
     this.base = `http://127.0.0.1:${port}`;
-    this.wsUrl = `ws://127.0.0.1:${port}`;
+    // WebSocket() can't set headers, so the token rides the query string.
+    this.wsUrl = `ws://127.0.0.1:${port}/?token=${encodeURIComponent(token)}`;
   }
 
   onState(cb: (p: Project, filePath: string | null) => void): void {
@@ -95,7 +100,7 @@ export class CoreApi {
 
   /** Build a URL the <video>/<img> tags can use to stream a local file. */
   fileUrl(path: string): string {
-    return `${this.base}/file?path=${encodeURIComponent(path)}`;
+    return `${this.base}/file?path=${encodeURIComponent(path)}&token=${encodeURIComponent(this.token)}`;
   }
 
   get httpBase(): string {

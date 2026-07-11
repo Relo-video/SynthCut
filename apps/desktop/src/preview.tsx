@@ -185,6 +185,9 @@ export const PreviewPlayer = forwardRef<PlayerHandle, Props>(function PreviewPla
   // Still images can't go through the <video> pool — cache one <img> per path and
   // repaint once it loads (so an image clip shows in the preview, not just export).
   const imgCacheRef = useRef(new Map<string, HTMLImageElement>());
+  // Offscreen buffer for ADJUSTMENT layers: the composite below is drawn here,
+  // then painted back through ctx.filter (mirrors the FFmpeg split→filter→overlay).
+  const adjCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const sigRef = useRef("");
 
   const [playing, setPlaying] = useState(false);
@@ -252,7 +255,30 @@ export const PreviewPlayer = forwardRef<PlayerHandle, Props>(function PreviewPla
         }
       }
     };
+    // ADJUSTMENT layer: repaint the composite drawn SO FAR through its color
+    // filter (lower layers only — higher tracks draw after, unaffected).
+    const applyAdjust = (filter: string) => {
+      if (!filter || filter === "none") return;
+      let off = adjCanvasRef.current;
+      if (!off) adjCanvasRef.current = off = document.createElement("canvas");
+      if (off.width !== W) off.width = W;
+      if (off.height !== H) off.height = H;
+      const octx = off.getContext("2d");
+      if (!octx) return;
+      octx.clearRect(0, 0, W, H);
+      octx.drawImage(canvas, 0, 0);
+      ctx.save();
+      ctx.globalAlpha = 1;
+      ctx.filter = filter;
+      ctx.clearRect(0, 0, W, H);
+      ctx.drawImage(off, 0, 0);
+      ctx.restore();
+    };
     for (const c of plan.clips) {
+      if (c.adjust) {
+        applyAdjust(c.adjust.colorFilter);
+        continue;
+      }
       if (!c.path) continue;
       if (c.isImage) {
         // Still image: draw from the <img> cache (no audio, no decoder pool).

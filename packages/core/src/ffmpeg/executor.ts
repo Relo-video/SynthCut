@@ -2,8 +2,9 @@ import { execa, type ResultPromise } from "execa";
 
 /**
  * Thin wrapper around the FFmpeg / ffprobe binaries. We invoke them as external
- * processes (never linked), which keeps this project's MIT license independent
- * of FFmpeg's GPL/LGPL components.
+ * processes (never linked), which keeps FFmpeg an external tool dependency —
+ * this project is GPL-3.0-or-later, and subprocess invocation means no FFmpeg
+ * build flavor (GPL or LGPL) is compiled or linked into our distribution.
  *
  * Binary paths can be overridden via AIVE_FFMPEG / AIVE_FFPROBE env vars (used
  * by packaged desktop builds that ship their own binaries). Otherwise we rely
@@ -94,10 +95,12 @@ export async function runFfmpeg(args: string[], opts: FfmpegRunOptions = {}): Pr
         const line = buf.slice(0, nl).trim();
         buf = buf.slice(nl + 1);
         // ffmpeg emits `out_time_us=<microseconds>` lines under -progress.
+        // NOTE: `out_time_ms` is ALSO microseconds — ffmpeg kept the wrong
+        // name for compatibility — so both divide by 1e6.
         if (line.startsWith("out_time_us=") || line.startsWith("out_time_ms=")) {
           const raw = Number(line.split("=")[1]);
           if (Number.isFinite(raw)) {
-            const seconds = line.startsWith("out_time_us=") ? raw / 1e6 : raw / 1e3;
+            const seconds = raw / 1e6;
             const frac = Math.max(0, Math.min(1, seconds / opts.totalDuration!));
             opts.onProgress!(frac);
           }
@@ -146,6 +149,48 @@ export async function runFfmpegCaptureStderr(args: string[]): Promise<string> {
 }
 
 /** Verify ffmpeg & ffprobe are available; returns their version banner lines. */
+let encodersPromise: Promise<Set<string>> | null = null;
+
+/**
+ * The set of encoder names this ffmpeg build ships (`ffmpeg -encoders`), probed
+ * once per process and cached. Used to opportunistically pick a HARDWARE H.264/
+ * HEVC encoder for previews/segment renders (2-10× faster than libx264).
+ */
+export function detectEncoders(): Promise<Set<string>> {
+  if (!encodersPromise) {
+    encodersPromise = execa(FFMPEG_BIN, ["-hide_banner", "-encoders"], { reject: true })
+      .then((r) => {
+        const names = new Set<string>();
+        // Lines look like " V....D h264_nvenc   NVIDIA NVENC H.264 encoder".
+        for (const line of r.stdout.split(/\r?\n/)) {
+          const m = /^\s*[A-Z.]{6}\s+(\S+)/.exec(line);
+          if (m) names.add(m[1]);
+        }
+        return names;
+      })
+      .catch(() => new Set<string>());
+  }
+  return encodersPromise;
+}
+
+/** Preference-ordered hardware encoders per codec (NVIDIA → Intel → AMD → Apple). */
+const HW_ENCODERS: Record<"h264" | "h265", string[]> = {
+  h264: ["h264_nvenc", "h264_qsv", "h264_amf", "h264_videotoolbox"],
+  h265: ["hevc_nvenc", "hevc_qsv", "hevc_amf", "hevc_videotoolbox"],
+};
+
+/**
+ * Pick the best available HARDWARE encoder for a codec, or null when none is
+ * available or hardware encoding is disabled (`AIVE_HWENC=off`; default auto).
+ * NOTE: a listed encoder can still fail at runtime (no GPU/driver) — callers
+ * must be prepared to retry with the software encoder.
+ */
+export async function pickHwEncoder(codec: "h264" | "h265"): Promise<string | null> {
+  if ((process.env.AIVE_HWENC ?? "auto").toLowerCase() === "off") return null;
+  const available = await detectEncoders();
+  return HW_ENCODERS[codec].find((e) => available.has(e)) ?? null;
+}
+
 export async function checkBinaries(): Promise<{ ffmpeg: string; ffprobe: string }> {
   const [ff, fp] = await Promise.all([
     execa(FFMPEG_BIN, ["-version"]).then((r) => r.stdout.split("\n")[0]),

@@ -23,6 +23,15 @@ const READ_ONLY = new Set([
 // model as an actual image (so it can SEE the frame, not just a file path).
 const IMAGE_TOOLS = new Set(["get_frame", "generate_thumbnail", "inspect_timeline", "inspect_clip"]);
 
+// Long-running tools: when the client's request carries a progressToken, the
+// core's progress/job broadcasts are forwarded as MCP notifications/progress
+// so the model watches renders instead of flying blind.
+const LONG_RUNNING = new Set([
+  "export_video", "render_preview", "generate_captions", "index_transcript",
+  "auto_reframe", "stabilize_clip", "add_graphic", "tighten_talk",
+  "generate_proxy", "index_visual", "get_frame", "inspect_timeline",
+]);
+
 const IMAGE_MIME: Record<string, string> = {
   ".png": "image/png",
   ".jpg": "image/jpeg",
@@ -98,7 +107,26 @@ async function main(): Promise<void> {
           ? { readOnlyHint: true }
           : { readOnlyHint: false, destructiveHint: name === "remove_clip" || name === "remove_asset" },
       },
-      async (args: Record<string, unknown>) => {
+      async (args: Record<string, unknown>, extra) => {
+        // Forward core progress as MCP progress notifications while this call runs.
+        let unsubscribe: (() => void) | undefined;
+        const progressToken = extra?._meta?.progressToken;
+        if (progressToken !== undefined && LONG_RUNNING.has(name)) {
+          let lastSent = 0;
+          unsubscribe = core.onEvent((ev) => {
+            const fraction = ev.type === "progress" ? ev.fraction : ev.job?.fraction;
+            if (typeof fraction !== "number") return;
+            const now = Date.now();
+            if (now - lastSent < 250 && fraction < 1) return; // throttle to ~4/s
+            lastSent = now;
+            void extra
+              .sendNotification({
+                method: "notifications/progress",
+                params: { progressToken, progress: fraction, total: 1 },
+              })
+              .catch(() => {});
+          });
+        }
         try {
           const result = await core.rpc(name, args ?? {});
           return IMAGE_TOOLS.has(name) ? await imageResult(name, result) : textResult(result);
@@ -107,6 +135,8 @@ async function main(): Promise<void> {
             isError: true,
             content: [{ type: "text" as const, text: err instanceof Error ? err.message : String(err) }],
           };
+        } finally {
+          unsubscribe?.();
         }
       },
     );
