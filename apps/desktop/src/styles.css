@@ -964,6 +964,9 @@ input[type="range"]:disabled { opacity: 0.45; }
 .connect-panel pre { background: var(--bg); border: 1px solid var(--line); border-radius: var(--r-md); padding: 13px; overflow-x: auto; font: 12px/1.5 var(--mono); color: var(--ink-2); }
 .connect-panel code { background: var(--bg); padding: 1px 5px; border-radius: 4px; font: 12px var(--mono); }
 .connect-panel .muted { color: var(--ink-3); font-size: 12px; }
+.connect-panel .insp-tabs { padding: 0 0 8px; margin-top: 6px; }
+.connect-steps { margin: 4px 0 10px; padding-left: 18px; color: var(--ink-2); font-size: 13px; line-height: 1.55; }
+.connect-steps li { margin: 4px 0; }
 .connect-code { position: relative; }
 .connect-code pre { padding-right: 66px; }  /* keep code clear of the Copy button */
 .copy-btn {

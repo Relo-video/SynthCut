@@ -1754,17 +1754,118 @@ function ProjectInspector({
 
 // A generic fallback shown only when the app can't resolve its own paths (e.g. a
 // plain browser dev run with no Electron bridge). The real app fills this in.
-const FALLBACK_CONFIG = `{
-  "mcpServers": {
-    "ai-video-editor": {
-      "command": "node",
-      "args": ["<absolute path to this project>/packages/mcp/dist/index.js"]
-    }
-  }
-}`;
+const FALLBACK_SERVER = {
+  command: "node",
+  args: ["<absolute path to this project>/packages/mcp/dist/index.js"],
+};
+
+type McpServer = { command: string; args: string[]; env?: Record<string, string> };
+
+/** JSON `mcpServers` block used by Claude Desktop, Cursor, Windsurf, and Gemini CLI. */
+function jsonBlock(server: McpServer): string {
+  return JSON.stringify({ mcpServers: { "ai-video-editor": server } }, null, 2);
+}
+
+/** TOML `mcp_servers` block used by Codex CLI. */
+function tomlBlock(server: McpServer): string {
+  const lines = [
+    "[mcp_servers.ai-video-editor]",
+    `command = ${JSON.stringify(server.command)}`,
+    `args = ${JSON.stringify(server.args)}`,
+  ];
+  if (server.env) lines.push(`env = ${JSON.stringify(server.env)}`);
+  return lines.join("\n");
+}
+
+/** `claude mcp add` one-liner used by Claude Code (CLI). */
+function claudeCodeCommand(server: McpServer): string {
+  const envFlags = Object.entries(server.env ?? {}).flatMap(([k, v]) => ["--env", `${k}=${v}`]);
+  return ["claude mcp add ai-video-editor", ...envFlags, "--", server.command, ...server.args].join(" ");
+}
+
+interface ClientDef {
+  id: string;
+  label: string;
+  /** Where the snippet goes / how to apply it, in order. */
+  steps: (server: McpServer) => string[];
+  snippet: (server: McpServer) => { code: string; lang: string };
+  restart: string;
+}
+
+const CLIENTS: ClientDef[] = [
+  {
+    id: "claude-desktop",
+    label: "Claude Desktop",
+    steps: () => [
+      "Open the config file — Windows: %APPDATA%\\Claude\\claude_desktop_config.json · macOS: ~/Library/Application Support/Claude/claude_desktop_config.json",
+      "Merge the block below into it (create the file if it doesn't exist).",
+    ],
+    snippet: (s) => ({ code: jsonBlock(s), lang: "json" }),
+    restart: "Fully quit and reopen Claude Desktop (closing the window isn't enough).",
+  },
+  {
+    id: "claude-code",
+    label: "Claude Code (CLI)",
+    steps: () => [
+      "Run this from anywhere — it registers the server for you (add -s user instead of the default project scope to make it available everywhere):",
+    ],
+    snippet: (s) => ({ code: claudeCodeCommand(s), lang: "bash" }),
+    restart: "No restart needed — run `claude mcp list` to verify, then just ask it to edit.",
+  },
+  {
+    id: "cursor",
+    label: "Cursor",
+    steps: () => [
+      "Open (or create) ~/.cursor/mcp.json for all projects, or .cursor/mcp.json in this project for just this one.",
+      "Merge the block below into it.",
+    ],
+    snippet: (s) => ({ code: jsonBlock(s), lang: "json" }),
+    restart: "Reload the Cursor window (Command Palette → Reload Window).",
+  },
+  {
+    id: "windsurf",
+    label: "Windsurf",
+    steps: () => [
+      "Open ~/.codeium/windsurf/mcp_config.json (create it if it doesn't exist).",
+      "Merge the block below into it.",
+    ],
+    snippet: (s) => ({ code: jsonBlock(s), lang: "json" }),
+    restart: "Reload the Windsurf window, or restart the app.",
+  },
+  {
+    id: "gemini-cli",
+    label: "Gemini CLI",
+    steps: () => [
+      "Open ~/.gemini/settings.json (create it if it doesn't exist).",
+      "Merge the block below into it.",
+    ],
+    snippet: (s) => ({ code: jsonBlock(s), lang: "json" }),
+    restart: "Restart the Gemini CLI session.",
+  },
+  {
+    id: "codex-cli",
+    label: "Codex CLI",
+    steps: () => [
+      "Open ~/.codex/config.toml (create it if it doesn't exist).",
+      "Append the block below (Codex uses TOML, not JSON).",
+    ],
+    snippet: (s) => ({ code: tomlBlock(s), lang: "toml" }),
+    restart: "Restart the Codex CLI session.",
+  },
+  {
+    id: "other",
+    label: "Other MCP client",
+    steps: () => [
+      "Any MCP-compatible client works. Most use the same JSON `mcpServers` shape below — check your client's docs for its config file location.",
+    ],
+    snippet: (s) => ({ code: jsonBlock(s), lang: "json" }),
+    restart: "Restart your AI client after editing its config.",
+  },
+];
 
 function ConnectPanel({ onClose }: { onClose: () => void }) {
   const [info, setInfo] = useState<{ packaged: boolean; available: boolean; json: string } | null>(null);
+  const [clientId, setClientId] = useState(CLIENTS[0].id);
   const [copied, setCopied] = useState(false);
 
   useEffect(() => {
@@ -1773,12 +1874,22 @@ function ConnectPanel({ onClose }: { onClose: () => void }) {
     return () => { alive = false; };
   }, []);
 
-  const config = info?.json ?? FALLBACK_CONFIG;
   const resolved = !!info?.available;
+  const server: McpServer = useMemo(() => {
+    if (!info?.json) return FALLBACK_SERVER;
+    try {
+      return JSON.parse(info.json).mcpServers["ai-video-editor"] as McpServer;
+    } catch {
+      return FALLBACK_SERVER;
+    }
+  }, [info]);
+
+  const client = CLIENTS.find((c) => c.id === clientId) ?? CLIENTS[0];
+  const { code, lang } = client.snippet(server);
 
   const copy = async () => {
     try {
-      await navigator.clipboard.writeText(config);
+      await navigator.clipboard.writeText(code);
       setCopied(true);
       setTimeout(() => setCopied(false), 1800);
     } catch { /* clipboard blocked — the user can still select the text */ }
@@ -1791,28 +1902,40 @@ function ConnectPanel({ onClose }: { onClose: () => void }) {
         <button className="icon-btn" onClick={onClose} aria-label="Close"><X /></button>
       </div>
       <p>
-        Add this to your MCP client's config (e.g. Claude Desktop's <code>claude_desktop_config.json</code>).
+        Pick your AI client for the exact steps.
         {resolved
-          ? " It's already filled in for this install — just copy it in as-is; no paths to edit."
+          ? " Paths below are already filled in for this install — copy as-is."
           : " Replace the placeholder path with the absolute path to this project on your machine."}
         {" "}The server attaches to this running editor automatically, so the AI and this window share the same project.
       </p>
+      <div className="insp-tabs" role="tablist">
+        {CLIENTS.map((c) => (
+          <button
+            key={c.id}
+            role="tab"
+            aria-selected={c.id === clientId}
+            className={`tab${c.id === clientId ? " active" : ""}`}
+            onClick={() => setClientId(c.id)}
+          >
+            {c.label}
+          </button>
+        ))}
+      </div>
+      <ol className="connect-steps">
+        {client.steps(server).map((s, i) => <li key={i}>{s}</li>)}
+      </ol>
       <div className="connect-code">
-        <button className="copy-btn" onClick={copy} aria-label="Copy config to clipboard">
+        <button className="copy-btn" onClick={copy} aria-label={`Copy ${lang} config to clipboard`}>
           {copied ? <><Check /> Copied</> : "Copy"}
         </button>
-        <pre>{config}</pre>
+        <pre>{code}</pre>
       </div>
       {info?.packaged && (
         <p className="muted">
           This uses the app's own runtime, so it works even without Node.js installed.
         </p>
       )}
-      <p className="muted">
-        Config file location — Windows: <code>%APPDATA%\Claude\claude_desktop_config.json</code>,
-        macOS: <code>~/Library/Application Support/Claude/claude_desktop_config.json</code>.
-        Fully restart your AI client after editing it, then ask it to import footage and make an edit.
-      </p>
+      <p className="muted">{client.restart} Then ask it to import footage and make an edit.</p>
     </div>
   );
 }

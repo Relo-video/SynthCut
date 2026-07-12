@@ -87,7 +87,7 @@ A single persistent **core** owns all editing state. The AI mutates a non-destru
 ```
 packages/core             @aive/core — headless editing engine + WebSocket server
 packages/mcp              @aive/mcp  — MCP server exposing editor tools to AI clients
-packages/skill-installer  @relo/synthcut — `npx @relo/synthcut add`: installs the pro-editor AI skill
+packages/skill-installer  @relo-video/synthcut — `npx @relo-video/synthcut add`: installs the pro-editor AI skill
 apps/desktop                         — Electron + React desktop UI
 ```
 
@@ -127,12 +127,12 @@ AI edits like someone who does it for a living.
 Install it into your AI client with one command:
 
 ```bash
-npx @relo/synthcut add        # interactive: pick your AI client, then project/global
+npx @relo-video/synthcut add        # interactive: pick your AI client, then project/global
 ```
 
-Or non-interactive: `npx @relo/synthcut add --client claude --scope project`.
+Or non-interactive: `npx @relo-video/synthcut add --client claude --scope project`.
 Re-run the same command later to update to the latest skill
-(`npx @relo/synthcut@latest add` to bypass a stale npx cache).
+(`npx @relo-video/synthcut@latest add` to bypass a stale npx cache).
 Supported clients: **Claude Code** (`.claude/skills/`), **Cursor**
 (`.cursor/rules/*.mdc`), **Codex CLI** and generic agents (`AGENTS.md`),
 **Gemini CLI** (`GEMINI.md`), **Windsurf** (`.windsurf/rules/`) — each gets the
@@ -143,8 +143,8 @@ in place; details in
 From a checkout of this repo (without npm):
 `node packages/skill-installer/bin/synthcut.mjs`.
 
-> Maintainers: `npx @relo/synthcut` resolves once the package is published
-> (`npm publish --workspace @relo/synthcut` — scoped, so `publishConfig.access`
+> Maintainers: `npx @relo-video/synthcut` resolves once the package is published
+> (`npm publish --workspace @relo-video/synthcut` — scoped, so `publishConfig.access`
 > is already set to public); bump its version in lockstep with the other
 > packages (see `docs/RELEASING.md`).
 
@@ -154,7 +154,40 @@ The Windows installer is **offline-first**: it bundles FFmpeg + ffprobe, whisper
 
 1. Run **`AI-Native Video Editor <version> Setup.exe`** and follow the installer.
 2. Because the build is **unsigned**, Windows SmartScreen may warn ("Windows protected your PC"). Click **More info → Run anyway**. (We can drop in an Authenticode certificate later — the config has a hook for it.)
-3. To drive it with AI, point Claude Desktop at the MCP server — see [`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md) and [`claude_desktop_config.example.json`](claude_desktop_config.example.json).
+3. To drive it with AI, connect an MCP client — see **Connect your AI client** below.
+
+## Connect your AI client
+
+The editor is a standard **MCP server** — any MCP-compatible client can drive it (Claude Desktop, Claude Code, Cursor, Windsurf, Gemini CLI, Codex CLI, or any other MCP client). The connection is always the same shape: your client launches `packages/mcp/dist/index.js` (or, in the packaged app, its own bundled runtime), which forwards tool calls to this app's running editor core — so the AI and this window always share one live project.
+
+**The exact, ready-to-paste config for your install is in the app itself:** click **Connect AI** (top of the window) → pick your client from the tabs → copy the snippet shown. It already has the correct absolute path and, for the packaged app, the right runtime flags filled in — no guessing paths.
+
+If you'd rather do it by hand, or you're running from a source checkout without the desktop app open, each client expects the server registered at a different location:
+
+| Client | Where it goes | Format |
+| --- | --- | --- |
+| **Claude Desktop** | `claude_desktop_config.json` (Windows: `%APPDATA%\Claude\`, macOS: `~/Library/Application Support/Claude/`) | JSON `mcpServers` |
+| **Claude Code (CLI)** | `claude mcp add ai-video-editor -- node <path>/packages/mcp/dist/index.js` (or use this repo's shipped [`.mcp.json`](.mcp.json) directly) | CLI command / JSON |
+| **Cursor** | `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` (project) | JSON `mcpServers` |
+| **Windsurf** | `~/.codeium/windsurf/mcp_config.json` | JSON `mcpServers` |
+| **Gemini CLI** | `~/.gemini/settings.json` | JSON `mcpServers` |
+| **Codex CLI** | `~/.codex/config.toml` | TOML `[mcp_servers.ai-video-editor]` |
+| **Other** | Check your client's docs — most accept the same JSON `mcpServers` shape | JSON `mcpServers` |
+
+All of them, in the JSON case, look like:
+
+```json
+{
+  "mcpServers": {
+    "ai-video-editor": {
+      "command": "node",
+      "args": ["<absolute path to this repo>/packages/mcp/dist/index.js"]
+    }
+  }
+}
+```
+
+Fully restart your client after editing its config (Claude Code needs no restart — `claude mcp list` confirms it's registered). For a from-source build, see [`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md) and [`claude_desktop_config.example.json`](claude_desktop_config.example.json) for a worked example.
 
 ## Build from source
 

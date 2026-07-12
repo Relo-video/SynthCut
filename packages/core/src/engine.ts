@@ -2784,8 +2784,17 @@ export class EditorEngine extends EventEmitter {
           await run(build(null).args); // hardware encoder failed at runtime → software
         }
       } catch (err) {
-        // Don't leave a half-written file behind on cancel/failure.
-        await rm(outputPath, { force: true }).catch(() => {});
+        // Don't leave a half-written file behind on cancel/failure. On Windows
+        // the OS can hold the file handle briefly after the killed ffmpeg
+        // process exits, so retry a few times instead of silently no-op'ing.
+        for (let attempt = 0; attempt < 5; attempt++) {
+          try {
+            await rm(outputPath, { force: true });
+            break;
+          } catch {
+            await new Promise((res) => setTimeout(res, 100));
+          }
+        }
         throw err;
       }
 
