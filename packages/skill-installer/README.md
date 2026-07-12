@@ -1,4 +1,4 @@
-# @relo/synthcut — skill installer
+# @relo-video/synthcut — skill installer
 
 Installs the SynthCut **video-editor-pro** skill into your AI client, so the AI
 that drives the [SynthCut MCP editor](../../README.md) edits like a professional:
@@ -6,20 +6,20 @@ inspect → plan → edit → verify → export, plus caption/color/motion-desig
 rules and exact tool recipes.
 
 ```bash
-npx @relo/synthcut add        # interactive: pick your AI client + project/global
+npx @relo-video/synthcut add        # interactive: pick your AI client + project/global
 ```
 
 Non-interactive:
 
 ```bash
-npx @relo/synthcut add --client claude --scope project
-npx @relo/synthcut add --client codex  --scope global
-npx @relo/synthcut add --client cursor --scope project --force
+npx @relo-video/synthcut add --client claude --scope project
+npx @relo-video/synthcut add --client codex  --scope global
+npx @relo-video/synthcut add --client cursor --scope project --force
 ```
 
 (No subcommand does the same thing; `skill`/`install` are aliases for `add`.
 Re-run the same command any time to get the latest skill — use
-`npx @relo/synthcut@latest add` to bypass a stale npx cache.)
+`npx @relo-video/synthcut@latest add` to bypass a stale npx cache.)
 
 | `--client` | project install | global install |
 |---|---|---|

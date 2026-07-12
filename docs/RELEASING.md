@@ -47,13 +47,13 @@ Keep these in lockstep — the app's version is `apps/desktop/package.json`:
 | `package.json` | repo root |
 | `packages/core/package.json` | `@aive/core` |
 | `packages/mcp/package.json` | `@aive/mcp` |
-| `packages/skill-installer/package.json` | `@relo/synthcut` (the `npx @relo/synthcut` skill installer) |
+| `packages/skill-installer/package.json` | `@relo-video/synthcut` (the `npx @relo-video/synthcut` skill installer) |
 | `apps/desktop/package.json` | `@aive/desktop` ← **the one the updater compares** |
 
 > Only `apps/desktop/package.json` strictly drives the update check, but bump all
-> five together so versions never diverge. The `@relo/synthcut` package additionally
-> ships to npm — after tagging, run `npm publish --workspace @relo/synthcut`
-> (that's what makes `npx @relo/synthcut add` work for users). It's a scoped
+> five together so versions never diverge. The `@relo-video/synthcut` package additionally
+> ships to npm — after tagging, run `npm publish --workspace @relo-video/synthcut`
+> (that's what makes `npx @relo-video/synthcut add` work for users). It's a scoped
 > package: publishing requires owning the npm `relo` scope (an npm org or the
 > username), and `publishConfig.access: public` is already set in its package.json.
 
