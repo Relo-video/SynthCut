@@ -1,0 +1,135 @@
+SynthCut AI Video Editor — Full Tool List (94 tools)
+======================================================
+
+IMPORT & PROJECT
+-----------------
+1. import_video — Import a local video/audio file into the project library; probes resolution, duration, fps, and audio.
+2. new_project — Start a fresh, empty project (auto-saves/recovers any unsaved work first).
+3. load_project — Load a project from a saved .aive file.
+4. save — Save the project to its current file.
+5. save_project — Save the project to a new .aive file path ("Save As").
+6. get_state — Return the full current project state (assets, tracks, clips, canvas).
+7. timeline_summary — Compact, human-readable summary of the timeline (tracks, clips, frame positions).
+8. set_project_settings — Change project name, output canvas width/height (aspect ratio), or fps.
+9. undo — Undo the last edit.
+10. redo — Redo the last undone edit.
+
+LIBRARY ORGANIZATION
+---------------------
+11. create_folder — Create a folder to organize imported assets.
+12. rename_folder — Rename a library folder.
+13. delete_folder — Delete a folder (its assets are kept, unfiled).
+14. move_asset_to_folder — Move an asset into (or out of) a folder.
+15. remove_asset — Remove an asset from the library (deletes any clips using it).
+16. generate_thumbnail — Generate a thumbnail image for an asset at a given time.
+17. generate_proxy — Force-generate a lightweight preview proxy for a large/4K asset (export still uses full resolution).
+
+UNDERSTANDING FOOTAGE (AI "watches" it)
+-----------------------------------------
+18. index_transcript — Transcribe a whole asset (local Whisper) with word-level timestamps; makes it searchable and text-editable.
+19. get_transcript — Retrieve the cached transcript of an asset (segments + numbered words).
+20. search_transcript — Search spoken words across all indexed assets by free text; returns ranked timestamped hits.
+21. locate_in_timeline — Find where a spoken phrase lands on the CURRENT timeline (as frame ranges), for transcript-driven cuts.
+22. index_visual — Build a perceptual/semantic visual fingerprint of an asset for appearance-based search.
+23. search_visual — Find shots by meaning ("wide shot of a sunset") or by visual similarity to a reference frame.
+24. analyze_scenes — Detect scene-change timestamps in footage (natural cut points).
+25. analyze_silence — Detect silent ranges/dead air in an asset's audio.
+26. get_frame — Render one composited frame of the current timeline at a given time, so the AI can literally see the edit.
+27. inspect_clip — Inspect a specific clip: its position, source range, what's already on it, and sampled composited frames — used to plan edits like zooms precisely.
+28. inspect_timeline — Timeline structure summary + a rendered frame in one call — the core "look before you act" tool.
+29. inspect_color — Objective color scopes (luma, saturation, hue, histogram/waveform/vectorscope) for the current composite.
+
+TIMELINE STRUCTURE & TRACKS
+------------------------------
+30. add_clip — Place a single clip on the timeline (track, position, in/out points).
+31. add_clips — Place several clips at once in one step.
+32. append_clip — Add a clip to the end of the base video track.
+33. insert_clip — Insert a clip at a position, rippling later clips right (nothing overwritten).
+34. move_clip — Move a clip to a new position/track.
+35. move_clips — Move several clips at once.
+36. trim_clip — Change which part of the source a clip uses without moving its timeline position.
+37. split_clip — Split a clip into two at a given point.
+38. cut_range — Remove a section from within a clip; everything after ripples left to close the gap.
+39. ripple_delete_ranges — Delete one or more timeline ranges across tracks in one pass, closing gaps.
+40. remove_clip — Delete a clip from the timeline.
+41. link_clips — Link clips (e.g. video + detached audio) so they move/trim/split together.
+42. unlink_clip — Unlink a previously linked clip group.
+43. add_track — Add a new video or audio track.
+44. remove_track — Remove a track and all its clips.
+45. reorder_track — Change a track's stacking order (which track composites on top).
+46. set_track_properties — Mute, hide, lock, rename, or set volume for a track.
+
+SPEED, TRANSFORM & ANIMATION
+--------------------------------
+47. set_clip_speed — Change a clip's playback speed (slow-motion to speed-ramp).
+48. set_clip_transform — Position/scale/rotate/flip a clip's picture within the canvas (zooms, punch-ins, picture-in-picture).
+49. set_keyframes — Animate a clip's position/scale/rotation/opacity/volume over time (Ken Burns, fly-ins, animated punch-ins).
+50. clear_keyframes — Remove keyframe animation from a clip.
+51. crop_clip — Crop a clip to a specific pixel rectangle (e.g. manual reframing).
+52. auto_reframe — Automatically reframe a clip to a new aspect ratio (e.g. 16:9 → 9:16) using face tracking.
+53. stabilize_clip — Stabilize shaky handheld footage.
+54. sync_audio — Align a clip to a reference clip by matching their audio (multi-cam/second-take sync).
+
+COLOR & EFFECTS
+------------------
+55. color_grade — Basic color grade: brightness, contrast, saturation, gamma.
+56. apply_color — Richer secondary grade: white balance, hue, color wheels (lift/gamma/gain), tone curves.
+57. apply_lut — Apply a cinematic .cube LUT to a clip.
+58. apply_effect — Add a visual effect (blur, sharpen, denoise, sepia, grayscale, vignette, edges, posterize, pixelate, chromakey/green-screen).
+59. remove_effect — Remove one applied effect from a clip.
+60. clear_clip_effects — Remove all color and effects from a clip at once.
+61. add_adjustment_clip — Add an adjustment layer that grades/effects everything on the tracks below it at once.
+
+TEXT, CAPTIONS & MOTION GRAPHICS
+------------------------------------
+62. add_text — Add a burned-in text overlay (title, lower-third, label) with full styling control.
+63. set_text_style — Restyle existing text overlay(s) without recreating them.
+64. set_text_window — Change when a text overlay appears/disappears on a clip.
+65. clear_text — Remove all text overlays from a clip.
+66. remove_text — Remove a single text overlay.
+67. animate_text — Animate a text overlay's position/opacity over time (native fly-ins, slides, fades — no code).
+68. generate_captions — Auto-transcribe and burn in styled captions from a clip's audio.
+69. set_caption_style — Restyle existing captions without re-transcribing.
+70. set_caption_cue — Move/resize a single caption cue.
+71. clear_captions — Remove the caption track from a clip.
+72. export_captions — Write all captions to a sidecar subtitle file (.srt/.vtt).
+73. import_captions — Attach an existing subtitle file to a clip as its captions.
+74. add_graphic — Add an AI-authored animated motion graphic (title card, lower-third, callout, or full motion-graphics clip).
+75. clear_graphics — Remove all motion-graphic overlays from a clip.
+76. remove_graphic — Remove a single motion-graphic overlay.
+77. set_graphic_window — Change when a motion graphic appears/disappears on a clip.
+
+TRANSITIONS
+--------------
+78. set_transition — Add a crossfade/wipe/slide/dissolve transition between adjacent clips.
+79. remove_transition — Remove a transition, reverting to a hard cut.
+
+AUDIO
+--------
+80. set_clip_volume — Set a clip's audio volume.
+81. set_clip_fade — Set fade-in/out for a clip (video and audio).
+82. set_audio_offset — Slide a clip's audio relative to its video for J-cuts/L-cuts.
+83. set_music — Set background music for the whole timeline, with optional auto-ducking under speech.
+84. remove_music — Remove the background music.
+
+TEXT-BASED (TRANSCRIPT) EDITING
+------------------------------------
+85. delete_transcript_ranges — Cut spoken content by word range across every placed clip of that asset.
+86. tighten_talk — One-call cleanup: removes filler words and shrinks long pauses for a clip, with a full report.
+87. edit_by_transcript — "Here's my script" — pass kept text and it assembles matching spans into a cut automatically.
+
+MARKERS
+----------
+88. set_markers — Set named/annotated markers on the timeline (notes, snap targets, review flags).
+
+JOBS & RENDERING
+-------------------
+89. list_jobs — List running/completed background jobs (export, transcribe, reframe, etc.) with progress.
+90. cancel_job — Cancel a running job.
+91. render_preview — Render a fast, lower-resolution but true composite of the whole timeline.
+92. export_video — Render the final video to a file, with platform presets (YouTube, Reels/Shorts/TikTok, square, web, master) or custom settings.
+
+INTERCHANGE
+--------------
+93. export_otio — Export the timeline as an OpenTimelineIO file for professional NLEs (DaVinci Resolve, Hiero, RV).
+94. import_otio — Import an OpenTimelineIO file as the current project.
