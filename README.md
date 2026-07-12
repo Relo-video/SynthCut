@@ -85,9 +85,10 @@ A single persistent **core** owns all editing state. The AI mutates a non-destru
 ## Repository layout
 
 ```
-packages/core    @aive/core  — headless editing engine + WebSocket server
-packages/mcp     @aive/mcp   — MCP server exposing editor tools to AI clients
-apps/desktop                 — Electron + React desktop UI
+packages/core             @aive/core — headless editing engine + WebSocket server
+packages/mcp              @aive/mcp  — MCP server exposing editor tools to AI clients
+packages/skill-installer  @relo/synthcut — `npx @relo/synthcut add`: installs the pro-editor AI skill
+apps/desktop                         — Electron + React desktop UI
 ```
 
 ## Features
@@ -112,6 +113,40 @@ A full multi-track, frame-based editing workstation. Every capability is exposed
 ## Interchange (OpenTimelineIO)
 
 Start the edit with AI in SynthCut, finish anywhere: `export_otio` writes the timeline as an [OpenTimelineIO](https://opentimeline.io) `.otio` file that DaVinci Resolve, Hiero, RV and other OTIO-capable tools read — tracks, clips, gaps, dissolves and speed all map natively, and everything OTIO can't express (effect stacks, keyframes, captions, motion graphics, adjustment layers) rides in `metadata.synthcut`, so `import_otio` restores a SynthCut export **losslessly**. Importing foreign OTIO works too: referenced media is probed from disk and anything missing becomes an offline placeholder asset ready for relinking.
+
+## Make your AI a professional editor — the `video-editor-pro` skill
+
+Connecting an AI client to the MCP server teaches it to *operate* the editor
+(the server injects its own operating manual). The **video-editor-pro skill**
+is the layer above that: the professional craft — the inspect → plan → edit →
+**verify with rendered frames** → export workflow, hook/pacing/caption/color/
+motion-design rules, and exact tool recipes (punch-in zooms, vertical reframes,
+silence cleanup, J/L cuts, music beds). With the skill installed, any capable
+AI edits like someone who does it for a living.
+
+Install it into your AI client with one command:
+
+```bash
+npx @relo/synthcut add        # interactive: pick your AI client, then project/global
+```
+
+Or non-interactive: `npx @relo/synthcut add --client claude --scope project`.
+Re-run the same command later to update to the latest skill
+(`npx @relo/synthcut@latest add` to bypass a stale npx cache).
+Supported clients: **Claude Code** (`.claude/skills/`), **Cursor**
+(`.cursor/rules/*.mdc`), **Codex CLI** and generic agents (`AGENTS.md`),
+**Gemini CLI** (`GEMINI.md`), **Windsurf** (`.windsurf/rules/`) — each gets the
+right file format and location for project or global scope. Re-running updates
+in place; details in
+[`packages/skill-installer/README.md`](packages/skill-installer/README.md).
+
+From a checkout of this repo (without npm):
+`node packages/skill-installer/bin/synthcut.mjs`.
+
+> Maintainers: `npx @relo/synthcut` resolves once the package is published
+> (`npm publish --workspace @relo/synthcut` — scoped, so `publishConfig.access`
+> is already set to public); bump its version in lockstep with the other
+> packages (see `docs/RELEASING.md`).
 
 ## Install (packaged app)
 
@@ -177,6 +212,23 @@ The bundled binaries are reused from the engine's own `~/.aive` cache when prese
 
 - **Packaged app:** none — everything needed is bundled (first run is offline).
 - **From source:** Node.js ≥ 20, plus FFmpeg + ffprobe on `PATH`.
+
+## Troubleshooting
+
+### Status pill shows "Offline" / "Disconnected"
+
+The desktop UI talks to the `core` backend (`127.0.0.1:4789` by default) over a WebSocket. The pill in the top bar turns green ("Core :4789") once that socket is open, and red ("Offline") when it's closed. The app retries the connection every second, but it reuses the port/token it launched with — it does **not** automatically pick up a new token if the core restarts, so a stuck "Offline" pill usually needs a relaunch rather than waiting it out.
+
+**Fix, in order:**
+
+1. **Relaunch the desktop app.** This resolves the vast majority of cases — on startup the app re-reads `~/.aive/data/server.json`, health-checks the core, and opens a fresh window with the current port + token.
+2. **Check whether the core is actually running.** Open `~/.aive/data/server.json` — it contains `{ port, pid, startedAt, token }`. If that `pid` isn't a live process, the core died; relaunching will spawn a new one.
+3. **Kill a wedged core.** If the `pid` is alive but not responding (e.g. `/health` times out), kill that process, then relaunch the app to spawn a fresh core.
+4. **Delete a stale `server.json`.** If it points at a dead core, remove `~/.aive/data/server.json` and relaunch for a clean respawn.
+5. **Port 4789 already in use by something else.** The core will fail to bind and exit before reporting "ready". Free the port, or set the `AIVE_PORT` environment variable to run the core on a different port.
+6. **Check the logs.** The core has no log file — it writes to stdout/stderr only. Running from source (`npm start`), these appear in the terminal (look for `[aive-core] listening on …`, `{"event":"ready"}`, or `[aive-core] fatal:`). In the packaged app, a failed core startup shows an error dialog ("Could not start the editor core").
+
+This most commonly happens when a **second core process** (e.g. one spawned by an MCP client) starts up and rotates the auth token while the desktop window is still open with the old one — every reconnect attempt then gets rejected. Closing and reopening the app picks up the live token again.
 
 ## License
 

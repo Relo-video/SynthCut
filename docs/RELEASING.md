@@ -38,7 +38,7 @@ Three things must line up or users get nothing:
 3. **The GitHub Release is _published_, not a draft.** `electron-updater` cannot
    see draft releases. (Our workflow already sets `draft: false`.)
 
-### The four version files to bump
+### The five version files to bump
 
 Keep these in lockstep — the app's version is `apps/desktop/package.json`:
 
@@ -47,10 +47,15 @@ Keep these in lockstep — the app's version is `apps/desktop/package.json`:
 | `package.json` | repo root |
 | `packages/core/package.json` | `@aive/core` |
 | `packages/mcp/package.json` | `@aive/mcp` |
+| `packages/skill-installer/package.json` | `@relo/synthcut` (the `npx @relo/synthcut` skill installer) |
 | `apps/desktop/package.json` | `@aive/desktop` ← **the one the updater compares** |
 
 > Only `apps/desktop/package.json` strictly drives the update check, but bump all
-> four together so versions never diverge.
+> five together so versions never diverge. The `@relo/synthcut` package additionally
+> ships to npm — after tagging, run `npm publish --workspace @relo/synthcut`
+> (that's what makes `npx @relo/synthcut add` work for users). It's a scoped
+> package: publishing requires owning the npm `relo` scope (an npm org or the
+> username), and `publishConfig.access: public` is already set in its package.json.
 
 ---
 

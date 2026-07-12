@@ -1,0 +1,30 @@
+{
+  "name": "@relo-video/synthcut",
+  "version": "0.1.2",
+  "publishConfig": {
+    "access": "public"
+  },
+  "description": "Installer for the SynthCut 'video-editor-pro' AI skill — teaches any AI client (Claude Code, Cursor, Codex, Gemini CLI, Windsurf) to operate the SynthCut MCP video editor like a professional.",
+  "license": "GPL-3.0-or-later",
+  "type": "module",
+  "bin": {
+    "synthcut": "bin/synthcut.mjs"
+  },
+  "files": [
+    "bin",
+    "skill",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "synthcut",
+    "video-editor",
+    "mcp",
+    "ai-skill",
+    "claude",
+    "cursor",
+    "agents"
+  ]
+}
