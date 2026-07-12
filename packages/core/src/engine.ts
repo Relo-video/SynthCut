@@ -2776,6 +2776,20 @@ export class EditorEngine extends EventEmitter {
             this.emit("progress", { job: "export", fraction });
           },
         });
+      // Don't leave a half-written (or, on a graceful SIGTERM, a fully
+      // finalized-but-unwanted) file behind on cancel/failure. Retry the
+      // delete a few times: on Windows the OS can hold the file handle
+      // briefly after the killed process exits.
+      const deletePartial = async () => {
+        for (let attempt = 0; attempt < 5; attempt++) {
+          try {
+            await rm(outputPath, { force: true });
+            return;
+          } catch {
+            await new Promise((res) => setTimeout(res, 100));
+          }
+        }
+      };
       try {
         try {
           await run(args);
@@ -2784,18 +2798,15 @@ export class EditorEngine extends EventEmitter {
           await run(build(null).args); // hardware encoder failed at runtime → software
         }
       } catch (err) {
-        // Don't leave a half-written file behind on cancel/failure. On Windows
-        // the OS can hold the file handle briefly after the killed ffmpeg
-        // process exits, so retry a few times instead of silently no-op'ing.
-        for (let attempt = 0; attempt < 5; attempt++) {
-          try {
-            await rm(outputPath, { force: true });
-            break;
-          } catch {
-            await new Promise((res) => setTimeout(res, 100));
-          }
-        }
+        await deletePartial();
         throw err;
+      }
+      // ffmpeg reacts to a cancelSignal's SIGTERM by finishing up gracefully
+      // (a complete, valid, but truncated file) rather than always rejecting
+      // — so `run()` above can resolve normally even though we canceled.
+      if (signal.aborted) {
+        await deletePartial();
+        throw new Error("Export canceled");
       }
 
       void pruneDataDir(this.dataDir).catch(() => {});
