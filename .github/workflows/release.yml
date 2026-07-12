@@ -28,6 +28,9 @@ jobs:
       - name: Build core + mcp + renderer
         run: npm run build
 
+      - name: Install FFmpeg (staging source; not shipped from here — prepare-bundle copies it in)
+        run: choco install ffmpeg -y --no-progress
+
       - name: Stage bundled FFmpeg/whisper/YuNet/font resources
         run: npm run prepare:bundle --workspace @aive/desktop
 
