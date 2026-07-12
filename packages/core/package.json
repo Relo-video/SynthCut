@@ -1,6 +1,6 @@
 {
   "name": "@aive/core",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Headless editing engine for the AI-Native Video Editor: non-destructive timeline, FFmpeg pipeline, HTTP/WebSocket server.",
   "license": "GPL-3.0-or-later",
   "type": "module",

@@ -102,7 +102,7 @@ export class EditorServer {
   async start(): Promise<number> {
     // `port: 0` means "pick an ephemeral port"; omit it to use AIVE_PORT or 4789.
     const desired = this.options.port ?? (process.env.AIVE_PORT ? Number(process.env.AIVE_PORT) : 4789);
-    await new Promise<void>((resolve) => this.http.listen(desired, "127.0.0.1", resolve));
+    await this.listen(desired);
     const addr = this.http.address();
     this.port = typeof addr === "object" && addr ? addr.port : desired;
 
@@ -114,6 +114,34 @@ export class EditorServer {
       "utf8",
     );
     return this.port;
+  }
+
+  /**
+   * Bind the desired port, retrying briefly on EADDRINUSE — the previous core
+   * process (e.g. one we just replaced across a fast auto-update restart) can
+   * hold the socket for a moment after exit even though it's already dead.
+   * Without this, `listen()`'s "error" event has no handler and Node rethrows
+   * it as an uncaught exception, crashing the process before it ever reports
+   * ready (surfaced to the user as "Core exited before ready (code 1)").
+   */
+  private listen(port: number, attempt = 0): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const onError = (err: NodeJS.ErrnoException) => {
+        this.http.removeListener("listening", onListening);
+        if (err.code === "EADDRINUSE" && attempt < 10) {
+          setTimeout(() => this.listen(port, attempt + 1).then(resolve, reject), 300);
+        } else {
+          reject(err);
+        }
+      };
+      const onListening = () => {
+        this.http.removeListener("error", onError);
+        resolve();
+      };
+      this.http.once("error", onError);
+      this.http.once("listening", onListening);
+      this.http.listen(port, "127.0.0.1");
+    });
   }
 
   getPort(): number {
