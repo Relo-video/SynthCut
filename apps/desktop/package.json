@@ -1,6 +1,6 @@
 {
   "name": "@aive/desktop",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Electron + React desktop UI for the AI-Native Video Editor. Shows the timeline, clip library and preview; reflects AI edits live.",
   "license": "GPL-3.0-or-later",
   "private": true,
