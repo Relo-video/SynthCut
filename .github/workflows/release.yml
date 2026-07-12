@@ -28,6 +28,9 @@ jobs:
       - name: Build core + mcp + renderer
         run: npm run build
 
+      - name: Stage bundled FFmpeg/whisper/YuNet/font resources
+        run: npm run prepare:bundle --workspace @aive/desktop
+
       - name: Package Windows installer + portable ZIP (+ SHA256SUMS)
         # `--publish never` = build the installer AND emit the update feed
         # (latest.yml + .blockmap) into build/dist, but let the release step below

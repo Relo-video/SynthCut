@@ -10,6 +10,12 @@ node_modules/
 dist/
 build/
 out/
+# apps/desktop/build/ holds packaging SOURCE assets (icon, afterbuild script)
+# alongside its own generated dist/ and downloaded resources/aive — keep the
+# source assets tracked, ignore only the generated parts.
+!apps/desktop/build/
+apps/desktop/build/dist/
+apps/desktop/build/resources/
 *.tsbuildinfo
 
 # Electron packaging / release artifacts
