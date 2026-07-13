@@ -30,6 +30,10 @@ The editor exposes itself as an **MCP (Model Context Protocol) server**, so any 
 
 > **Status:** Stable. A full multi-track, frame-based editor with **85 MCP tools** — from import/cut/trim to per-clip transforms + keyframe animation, color grading, an effects stack, Whisper captions, subject-aware auto-reframe, motion graphics, media intelligence (transcript + semantic visual search), and platform export presets.
 
+## Making social media videos? Try relo.video
+
+SynthCut is the open-source, self-hosted engine — an AI *drives* it, but you still install it, connect an MCP client, and manage the project yourself. If you'd rather skip all of that and just get a finished Reel, TikTok, Short, or LinkedIn post, our hosted sibling **[relo.video](https://relo.video)** is built specifically for that: describe a product or idea and it generates a fully animated video (kinetic type, animated icons, voiceover, auto captions) with no footage required, or upload raw/unedited clips and it adds captions, color grading, music sync, and motion-graphics overlays for you. Editing happens by chat instead of a timeline — you ask for a change (bigger headline, slower intro) and it rebuilds the preview — and a single upload exports to vertical, square, and horizontal cuts at once. There's a free tier (100 credits, no card required) good for about two full videos.
+
 ## Download & install (Windows)
 
 For people who just want to **use** the app — no build tools or coding needed.
