@@ -3,6 +3,58 @@
 This file explains how users connect SynthCut by Relo to AI clients that support
 MCP.
 
+---
+
+## Developer Setup (running from source)
+
+If you are running SynthCut from source with `npm run dev` or `npm start`, use
+the built MCP package directly with plain `node` — no Electron binary needed.
+
+**Prerequisites:** build the packages first:
+
+```cmd
+npm run build
+```
+
+This produces `packages/mcp/dist/index.js`.
+
+### Claude Code (dev)
+
+```cmd
+claude mcp add -s user ai-video-editor -- node "REPO_ROOT\packages\mcp\dist\index.js"
+```
+
+Replace `REPO_ROOT` with the absolute path to your clone, e.g.:
+
+```cmd
+claude mcp add -s user ai-video-editor -- node "C:\Users\Dhruv\Desktop\AI_native_editor\packages\mcp\dist\index.js"
+```
+
+### Claude Desktop / other clients (dev)
+
+```json
+{
+  "mcpServers": {
+    "ai-video-editor": {
+      "command": "node",
+      "args": ["C:\\Users\\Dhruv\\Desktop\\AI_native_editor\\packages\\mcp\\dist\\index.js"]
+    }
+  }
+}
+```
+
+> **Note:** The dev core must already be running (`npm run core` or `npm start`)
+> before the MCP server can connect, or start the Electron app first so it boots
+> the core automatically.
+
+> **Path changes:** Dev and installed-app MCP paths are different. If you switch
+> between dev and the installed app, remove and re-add the MCP entry with the
+> correct path.
+
+---
+
+## Installed App Setup
+
 For users who installed SynthCut from the `.exe` installer or portable `.zip`,
 the safest setup is:
 

@@ -171,7 +171,7 @@ If you'd rather do it by hand, or you're running from a source checkout without 
 | Client | Where it goes | Format |
 | --- | --- | --- |
 | **Claude Desktop** | `claude_desktop_config.json` (Windows: `%APPDATA%\Claude\`, macOS: `~/Library/Application Support/Claude/`) | JSON `mcpServers` |
-| **Claude Code (CLI)** | `claude mcp add ai-video-editor -- node <path>/packages/mcp/dist/index.js` (or use this repo's shipped [`.mcp.json`](.mcp.json) directly) | CLI command / JSON |
+| **Claude Code (CLI)** | `claude mcp add -s user ai-video-editor -- node "<path>/packages/mcp/dist/index.js"` (or use this repo's shipped [`.mcp.json`](.mcp.json) directly) | CLI command / JSON |
 | **Cursor** | `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` (project) | JSON `mcpServers` |
 | **Windsurf** | `~/.codeium/windsurf/mcp_config.json` | JSON `mcpServers` |
 | **Gemini CLI** | `~/.gemini/settings.json` | JSON `mcpServers` |
@@ -238,7 +238,7 @@ node apps/desktop/scripts/prepare-bundle.ts      # needs ffmpeg/ffprobe on PATH
 
 # 2. Build the renderer + the NSIS installer  (output: apps/desktop/build/dist)
 npm run build
-npm run dist --workspace @aive/desktop
+npm run dist --workspace synthcut-by-relo
 ```
 
 The bundled binaries are reused from the engine's own `~/.aive` cache when present, so the slow downloads happen at most once. The packaged app points the engine at the bundled copies via env overrides (`AIVE_FFMPEG`, `AIVE_WHISPER_BIN`, …) — the same variables you can set by hand for a source checkout.

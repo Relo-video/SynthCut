@@ -1780,7 +1780,8 @@ function tomlBlock(server: McpServer): string {
 /** `claude mcp add` one-liner used by Claude Code (CLI). */
 function claudeCodeCommand(server: McpServer): string {
   const envFlags = Object.entries(server.env ?? {}).flatMap(([k, v]) => ["--env", `${k}=${v}`]);
-  return ["claude mcp add ai-video-editor", ...envFlags, "--", server.command, ...server.args].join(" ");
+  const quote = (s: string) => (s.includes(" ") ? `"${s}"` : s);
+  return ["claude mcp add -s user ai-video-editor", ...envFlags, "--", quote(server.command), ...server.args.map(quote)].join(" ");
 }
 
 interface ClientDef {
