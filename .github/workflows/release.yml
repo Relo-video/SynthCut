@@ -32,13 +32,13 @@ jobs:
         run: choco install ffmpeg -y --no-progress
 
       - name: Stage bundled FFmpeg/whisper/YuNet/font resources
-        run: npm run prepare:bundle --workspace @aive/desktop
+        run: npm run prepare:bundle --workspace synthcut-by-relo
 
       - name: Package Windows installer + portable ZIP (+ SHA256SUMS)
         # `--publish never` = build the installer AND emit the update feed
         # (latest.yml + .blockmap) into build/dist, but let the release step below
         # do the actual upload. Avoids electron-builder needing its own token here.
-        run: npm run dist --workspace @aive/desktop -- --publish never
+        run: npm run dist --workspace synthcut-by-relo -- --publish never
 
       # --- Free code signing for open source (optional) -----------------------
       # Once approved by SignPath Foundation (https://signpath.org), uncomment and
