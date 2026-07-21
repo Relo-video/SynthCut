@@ -23,7 +23,7 @@ any MCP-compatible AI client drives real, local FFmpeg edits, fully offline.
 </div>
 
 <div align="center">
-  <video src="docs/demo.mp4" controls autoplay muted loop width="100%" style="max-width:860px;border-radius:8px;"></video>
+  <video src="https://raw.githubusercontent.com/Relo-video/SynthCut/main/docs/demo.mp4" controls autoplay muted loop width="100%" style="max-width:860px;border-radius:8px;"></video>
 </div>
 
 ---
