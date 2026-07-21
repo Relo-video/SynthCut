@@ -23,7 +23,7 @@ any MCP-compatible AI client drives real, local FFmpeg edits, fully offline.
 </div>
 
 <div align="center">
-  <video src="https://github.com/user-attachments/assets/1b8949fb-0489-4592-87f1-affd069d266e" controls muted loop width="100%"></video>
+  <video src="https://github.com/user-attachments/assets/1b8949fb-0489-4592-87f1-affd069d266e" poster="https://github.com/user-attachments/assets/4de5bf0e-3654-451f-b35f-10ce6e3bce59" controls muted loop width="100%"></video>
 </div>
 
 ---

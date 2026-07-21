@@ -48,7 +48,7 @@ Keep these in lockstep — the app's version is `apps/desktop/package.json`:
 | `packages/core/package.json` | `@aive/core` |
 | `packages/mcp/package.json` | `@aive/mcp` |
 | `packages/skill-installer/package.json` | `@relo-video/synthcut` (the `npx @relo-video/synthcut` skill installer) |
-| `apps/desktop/package.json` | `@aive/desktop` ← **the one the updater compares** |
+| `apps/desktop/package.json` | `synthcut-by-relo` ← **the one the updater compares** |
 
 > Only `apps/desktop/package.json` strictly drives the update check, but bump all
 > five together so versions never diverge. The `@relo-video/synthcut` package additionally
