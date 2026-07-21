@@ -22,6 +22,10 @@ any MCP-compatible AI client drives real, local FFmpeg edits, fully offline.
 
 </div>
 
+<div align="center">
+  <video src="docs/demo.mp4" controls autoplay muted loop width="100%" style="max-width:860px;border-radius:8px;"></video>
+</div>
+
 ---
 
 Every video editor today — Premiere, DaVinci Resolve, CapCut — is designed for a person to click and drag. AI models can understand a user's creative intent perfectly, but they can't *operate* those tools. This project flips that: the AI is the primary operator. You describe the edit in plain language, the AI does it, you review and course-correct.
