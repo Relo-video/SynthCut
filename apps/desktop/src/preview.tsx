@@ -112,10 +112,10 @@ function bufferSize(project: Project | null, maxLongEdge = 1280): { w: number; h
  * rotate, flip, translate about the canvas centre) → color filter → alpha. The
  * transform mirrors the FFmpeg geq bake so preview and export agree.
  */
-function drawLayer(ctx: CanvasRenderingContext2D, el: HTMLVideoElement | HTMLImageElement, d: NonNullable<ActiveClip["draw"]>, W: number, H: number) {
+function drawLayer(ctx: CanvasRenderingContext2D, el: HTMLVideoElement | HTMLImageElement | HTMLCanvasElement, d: NonNullable<ActiveClip["draw"]>, W: number, H: number) {
   // Intrinsic source dimensions: <video> exposes videoWidth, <img> naturalWidth.
-  const iw = (el as HTMLVideoElement).videoWidth || (el as HTMLImageElement).naturalWidth;
-  const ih = (el as HTMLVideoElement).videoHeight || (el as HTMLImageElement).naturalHeight;
+  const iw = (el as HTMLVideoElement).videoWidth || (el as HTMLImageElement).naturalWidth || (el as HTMLCanvasElement).width;
+  const ih = (el as HTMLVideoElement).videoHeight || (el as HTMLImageElement).naturalHeight || (el as HTMLCanvasElement).height;
   const sx = d.crop?.x ?? 0;
   const sy = d.crop?.y ?? 0;
   const sw = d.crop?.width ?? iw;
@@ -247,10 +247,11 @@ export const PreviewPlayer = forwardRef<PlayerHandle, Props>(function PreviewPla
       for (const g of gs) {
         const gel = pool.acquire(`gfx:${g.key}`, g.path);
         pool.sync(gel, { srcTime: g.srcTime, playing: playingRef.current, rate: 1, volume: 0, muted: true });
-        if (gel.readyState >= 2 && gel.videoWidth > 0) {
+        const graphicFrame = pool.frame(gel);
+        if (graphicFrame) {
           ctx.save();
           ctx.globalAlpha = clamp01(g.opacity);
-          try { ctx.drawImage(gel, 0, 0, W, H); } catch { /* not decodable this frame */ }
+          try { ctx.drawImage(graphicFrame, 0, 0, W, H); } catch { /* not decodable this frame */ }
           ctx.restore();
         }
       }
@@ -303,7 +304,8 @@ export const PreviewPlayer = forwardRef<PlayerHandle, Props>(function PreviewPla
         volume: c.audio?.volume ?? 0,
         muted: !c.audio,
       });
-      if (c.draw && el.readyState >= 2 && el.videoWidth > 0) drawLayer(ctx, el, c.draw, W, H);
+      const picture = c.draw ? pool.frame(el) : undefined;
+      if (c.draw && picture) drawLayer(ctx, picture, c.draw, W, H);
       paintGraphics(c.graphics);
     }
     pool.endFrame();

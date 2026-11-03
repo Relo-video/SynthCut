@@ -29,6 +29,8 @@ export class MediaPool {
   private readonly lru: string[] = [];
   /** clipIds acquired in the current frame (protected from eviction/pause). */
   private used = new Set<string>();
+  private readonly starting = new WeakSet<HTMLVideoElement>();
+  private readonly frames = new WeakMap<HTMLVideoElement, HTMLCanvasElement>();
 
   constructor(host: HTMLElement, fileUrl: (path: string) => string, onSeeked: () => void, cap = 8) {
     this.host = host;
@@ -54,6 +56,7 @@ export class MediaPool {
       this.byClip.set(clipId, el);
     }
     if (el.dataset.path !== path) {
+      this.frames.delete(el);
       el.dataset.path = path;
       el.src = this.fileUrl(path);
       el.load();
@@ -63,16 +66,21 @@ export class MediaPool {
 
   /** Drive an element toward `srcTime`, correcting drift sparingly while playing. */
   sync(el: HTMLVideoElement, o: SyncOpts): void {
-    el.playbackRate = o.rate > 0 ? o.rate : 1;
+    const rate = o.rate > 0 ? o.rate : 1;
+    if (el.playbackRate !== rate) el.playbackRate = rate;
     el.muted = o.muted || o.volume <= 0;
     el.volume = clamp01(o.volume);
     if (!Number.isFinite(o.srcTime)) return;
 
     if (o.playing) {
       if (el.paused) {
-        this.safeSeek(el, o.srcTime);
-        void el.play().catch(() => {});
-      } else if (Math.abs(el.currentTime - o.srcTime) > 0.08) {
+        // play() is asynchronous. Re-seeking on every RAF while it is pending
+        // can continually restart the decoder before it produces a frame.
+        if (this.starting.has(el)) return;
+        if (Math.abs(el.currentTime - o.srcTime) > 0.02) this.safeSeek(el, o.srcTime);
+        this.starting.add(el);
+        void el.play().catch(() => {}).finally(() => this.starting.delete(el));
+      } else if (!el.seeking && Math.abs(el.currentTime - o.srcTime) > 0.25) {
         // Re-sync only on meaningful drift — constant reseeking would stutter.
         this.safeSeek(el, o.srcTime);
       }
@@ -80,6 +88,26 @@ export class MediaPool {
       if (!el.paused) el.pause();
       if (Math.abs(el.currentTime - o.srcTime) > 0.02) this.safeSeek(el, o.srcTime);
     }
+  }
+
+  /** Hold the last decoded picture while seeking/buffering instead of flashing
+   * the compositor's black background whenever readyState temporarily drops. */
+  frame(el: HTMLVideoElement): HTMLCanvasElement | undefined {
+    let frame = this.frames.get(el);
+    if (!el.seeking && el.readyState >= 2 && el.videoWidth > 0 && el.videoHeight > 0) {
+      const next = frame ?? document.createElement("canvas");
+      if (next.width !== el.videoWidth) next.width = el.videoWidth;
+      if (next.height !== el.videoHeight) next.height = el.videoHeight;
+      const ctx = next.getContext("2d");
+      if (ctx) {
+        try {
+          ctx.drawImage(el, 0, 0);
+          frame = next;
+          this.frames.set(el, next);
+        } catch { /* retain the previous picture until a new frame is available */ }
+      }
+    }
+    return frame;
   }
 
   /** Pause every element not acquired in the current frame (it left the playhead). */
@@ -107,6 +135,8 @@ export class MediaPool {
   }
 
   private safeSeek(el: HTMLVideoElement, srcTime: number): void {
+    // Let an in-flight decode complete; scrubbing will catch up on seeked.
+    if (el.seeking) return;
     try {
       el.currentTime = Math.max(0, srcTime);
     } catch {
@@ -129,6 +159,7 @@ export class MediaPool {
         this.byClip.delete(victim);
         this.lru.splice(this.lru.indexOf(victim), 1);
         el.pause();
+        this.frames.delete(el);
         delete el.dataset.clipId;
         delete el.dataset.path;
         el.removeAttribute("src");
